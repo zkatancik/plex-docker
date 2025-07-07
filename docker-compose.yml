@@ -1,0 +1,216 @@
+version: "3.8"
+
+networks:
+  default:
+  vpn_net:
+
+services:
+  # ─── VPN client ────────────────────────────────────────────
+  gluetun:
+    image: qmcgaw/gluetun
+    container_name: gluetun
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - VPN_SERVICE_PROVIDER=protonvpn
+      - VPN_TYPE=wireguard
+      - WIREGUARD_PRIVATE_KEY=${WIREGUARD_PRIVATE_KEY}
+      - WIREGUARD_ADDRESSES=10.2.0.2/32
+      - TZ=${TZ}
+      - DOCKER_VPN_NETWORK=vpn_net
+      - DOCKER_ALLOWED_INCOMING_PORTS=8080,6881,8191,9696
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - VPN_PORT_FORWARDING=on
+      - DNS_SERVERS=1.1.1.1,1.0.0.1,8.8.8.8,8.8.4.4
+      - HEALTH_VPN_DURATION_INITIAL=30s
+      - HEALTH_SUCCESS_WAIT_DURATION=5s
+      - FIREWALL_DEBUG=on
+      - FIREWALL_INPUT_PORTS=8080,6881,9696,8191
+      - BLOCK_MALICIOUS=off
+      - BLOCK_ADS=off
+      - BLOCK_SURVEILLANCE=off
+      - DOT=off
+    ports:
+      - "8080:8080/tcp"    # qBittorrent Web UI
+      - "6881:6881/tcp"    # torrenting TCP
+      - "6881:6881/udp"    # torrenting UDP
+      - "8191:8191"        # flaresolverr
+      - "9696:9696"        # prowlarr
+    volumes:
+      - /mnt/SamsungSSD1/docker/gluetun:/gluetun
+      - /mnt/SamsungSSD1/docker/gluetun:/tmp/gluetun 
+    networks:
+      - vpn_net
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    restart: unless-stopped
+    dns:
+      - 1.1.1.1
+      - 1.0.0.1
+      - 8.8.8.8
+
+  # ─── qBittorrent through VPN ─────────────────────────────────────────
+  qbittorrent:
+    image: linuxserver/qbittorrent
+    container_name: qbittorrent
+    network_mode: "service:gluetun"
+    depends_on:
+      - gluetun
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+      - WEBUI_PORT=8080
+    volumes:
+      - /mnt/SamsungSSD1/docker/downloads:/downloads
+      - /mnt/SamsungSSD1/docker/qbittorrent:/config
+    restart: unless-stopped
+
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: flaresolverr
+    network_mode: "service:gluetun"          # stays inside the VPN
+    environment:
+      - LOG_LEVEL=info
+      - TZ=${TZ}
+    restart: unless-stopped
+
+  qb-port-sync:
+    image: patrickaclark/gluetun-qbittorrent-port-manager:latest
+    container_name: qb-port-sync
+    network_mode: "service:gluetun"      # same net-ns as Qbit & Gluetun
+    depends_on:
+      - gluetun
+      - qbittorrent
+    environment:
+      - PORT_FORWARDED=/tmp/gluetun/forwarded_port   # read the file Gluetun writes
+      - QBITTORRENT_SERVER=localhost             # Qbit is localhost in-ns
+      - QBITTORRENT_PORT=8080                    # your WEBUI_PORT
+      - GLUETUN_HOST=localhost                   # control server inside ns
+      - GLUETUN_PORT=8000                        # default control-server port
+      - RECHECK_TIME=60                          # seconds between checks
+      - QBITTORRENT_USERNAME=${QBITTORRENT_USER}
+      - QBITTORRENT_PASSWORD=${QBITTORRENT_PASS}
+    volumes:
+      - /mnt/SamsungSSD1/docker/gluetun:/tmp/gluetun:ro
+    restart: unless-stopped
+
+  # ─── Sonarr (TV shows) ────────────────────────────────────────────────
+  sonarr:
+    image: linuxserver/sonarr
+    container_name: sonarr
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    volumes:
+      - /mnt/SamsungSSD1/docker/sonarr:/config
+      - /mnt/SamsungSSD1/media/tv:/tv
+      - /mnt/SamsungSSD1/docker/downloads:/downloads
+    ports:
+      - "8989:8989"
+    networks:
+      - default
+      - vpn_net
+    restart: unless-stopped
+
+  # ─── Radarr (Movies) ──────────────────────────────────────────────────
+  radarr:
+    image: linuxserver/radarr
+    container_name: radarr
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    volumes:
+      - /mnt/SamsungSSD1/docker/radarr:/config
+      - /mnt/SamsungSSD1/media/movies:/movies
+      - /mnt/SamsungSSD1/docker/downloads:/downloads
+    ports:
+      - "7878:7878"
+    networks:
+      - default
+      - vpn_net
+    restart: unless-stopped
+
+  # ─── Unpackerr (Handles compressed downloads) ─────────────────────
+  unpackerr:
+    image: golift/unpackerr:latest
+    container_name: unpackerr
+    user: "${PUID}:${PGID}"
+    networks:
+      - vpn_net
+    environment:
+      - TZ=${TZ}
+      # Sonarr Integration (replace API key)
+      - UN_SONARR_0_URL=http://sonarr:8989
+      - UN_SONARR_0_API_KEY=${SONARR_API_KEY}
+      - UN_SONARR_0_PATH=/downloads
+      # Radarr Integration (replace API key)
+      - UN_RADARR_0_URL=http://radarr:7878
+      - UN_RADARR_0_API_KEY=${RADARR_API_KEY}
+      - UN_RADARR_0_PATH=/downloads
+      # qBittorrent Integration (watches for completed downloads)
+      - UN_QBITTORRENT_0_URL=http://gluetun:8080
+      - UN_QBITTORRENT_0_USER=${QBITTORRENT_USER}
+      - UN_QBITTORRENT_0_PASS=${QBITTORRENT_PASS}
+      - UN_QBITTORRENT_0_PATH=/downloads
+    volumes:
+      - /mnt/SamsungSSD1/docker/unpackerr:/config
+      - /mnt/SamsungSSD1/docker/downloads:/downloads
+    restart: unless-stopped
+
+  # ─── Recyclarr (Autofetch Sonarr and Radarr profiles) ---------------
+  recyclarr:
+    image: ghcr.io/recyclarr/recyclarr:latest
+    container_name: recyclarr
+    user: 1000:1000
+    network_mode: "service:gluetun"      # keep traffic inside VPN
+    volumes:
+      - /mnt/SamsungSSD1/docker/recyclarr:/config   # holds YAML & backups
+    environment:
+      - TZ=America/Chicago
+      - CRON_SCHEDULE= 0 3,15 * * *
+    restart: unless-stopped      
+
+  # ─── Prowlarr (Indexer manager) ─────────────────────────────────────
+  prowlarr:
+    image: linuxserver/prowlarr
+    container_name: prowlarr
+    network_mode: "service:gluetun"
+    depends_on:
+      - gluetun
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    volumes:
+      - /mnt/SamsungSSD1/docker/prowlarr:/config
+    restart: unless-stopped
+
+  # ─── Overseerr (Requests UI) ─────────────────────────────────────────
+  overseerr:
+    image: linuxserver/overseerr
+    container_name: overseerr
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    volumes:
+      - /mnt/SamsungSSD1/docker/overseerr:/config
+    ports:
+      - "5055:5055"
+    restart: unless-stopped
+
+  cloudflared:
+    image: cloudflare/cloudflared:2025.5.0
+    container_name: cloudflared
+    restart: unless-stopped
+    command: tunnel run
+    environment:
+      - TUNNEL_TOKEN=${CLOUDFLARED_TUNNEL_TOKEN}
+    volumes:
+      - ./cloudflared:/etc/cloudflared
+    networks:
+      - default
