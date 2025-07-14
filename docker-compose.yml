@@ -38,8 +38,8 @@ services:
       - "8191:8191"        # flaresolverr
       - "9696:9696"        # prowlarr
     volumes:
-      - /mnt/SamsungSSD1/docker/gluetun:/gluetun
-      - /mnt/SamsungSSD1/docker/gluetun:/tmp/gluetun 
+      - /DATA/docker/gluetun:/gluetun
+      - /DATA/docker/gluetun:/tmp/gluetun 
     networks:
       - vpn_net
     devices:
@@ -63,8 +63,8 @@ services:
       - TZ=${TZ}
       - WEBUI_PORT=8080
     volumes:
-      - /mnt/SamsungSSD1/docker/downloads:/downloads
-      - /mnt/SamsungSSD1/docker/qbittorrent:/config
+      - /DATA/docker/downloads:/downloads
+      - /DATA/docker/qbittorrent:/config
     restart: unless-stopped
 
   flaresolverr:
@@ -93,7 +93,7 @@ services:
       - QBITTORRENT_USERNAME=${QBITTORRENT_USER}
       - QBITTORRENT_PASSWORD=${QBITTORRENT_PASS}
     volumes:
-      - /mnt/SamsungSSD1/docker/gluetun:/tmp/gluetun:ro
+      - /DATA/docker/gluetun:/tmp/gluetun:ro
     restart: unless-stopped
 
   # ─── Sonarr (TV shows) ────────────────────────────────────────────────
@@ -105,9 +105,9 @@ services:
       - PGID=${PGID}
       - TZ=${TZ}
     volumes:
-      - /mnt/SamsungSSD1/docker/sonarr:/config
-      - /mnt/SamsungSSD1/media/tv:/tv
-      - /mnt/SamsungSSD1/docker/downloads:/downloads
+      - /DATA/docker/sonarr:/config
+      - /DATA/media/tv:/tv
+      - /DATA/docker/downloads:/downloads
     ports:
       - "8989:8989"
     networks:
@@ -124,9 +124,9 @@ services:
       - PGID=${PGID}
       - TZ=${TZ}
     volumes:
-      - /mnt/SamsungSSD1/docker/radarr:/config
-      - /mnt/SamsungSSD1/media/movies:/movies
-      - /mnt/SamsungSSD1/docker/downloads:/downloads
+      - /DATA/docker/radarr:/config
+      - /DATA/media/movies:/movies
+      - /DATA/docker/downloads:/downloads
     ports:
       - "7878:7878"
     networks:
@@ -157,8 +157,8 @@ services:
       - UN_QBITTORRENT_0_PASS=${QBITTORRENT_PASS}
       - UN_QBITTORRENT_0_PATH=/downloads
     volumes:
-      - /mnt/SamsungSSD1/docker/unpackerr:/config
-      - /mnt/SamsungSSD1/docker/downloads:/downloads
+      - /DATA/docker/unpackerr:/config
+      - /DATA/docker/downloads:/downloads
     restart: unless-stopped
 
   # ─── Recyclarr (Autofetch Sonarr and Radarr profiles) ---------------
@@ -168,7 +168,7 @@ services:
     user: 1000:1000
     network_mode: "service:gluetun"      # keep traffic inside VPN
     volumes:
-      - /mnt/SamsungSSD1/docker/recyclarr:/config   # holds YAML & backups
+      - /DATA/docker/recyclarr:/config   # holds YAML & backups
     environment:
       - TZ=America/Chicago
       - CRON_SCHEDULE= 0 3,15 * * *
@@ -186,7 +186,7 @@ services:
       - PGID=${PGID}
       - TZ=${TZ}
     volumes:
-      - /mnt/SamsungSSD1/docker/prowlarr:/config
+      - /DATA/docker/prowlarr:/config
     restart: unless-stopped
 
   # ─── Overseerr (Requests UI) ─────────────────────────────────────────
@@ -198,7 +198,7 @@ services:
       - PGID=${PGID}
       - TZ=${TZ}
     volumes:
-      - /mnt/SamsungSSD1/docker/overseerr:/config
+      - /DATA/docker/overseerr:/config
     ports:
       - "5055:5055"
     restart: unless-stopped
