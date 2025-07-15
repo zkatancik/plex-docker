@@ -165,7 +165,7 @@ services:
   recyclarr:
     image: ghcr.io/recyclarr/recyclarr:latest
     container_name: recyclarr
-    user: 1000:1000
+    user: "${PUID}:${PGID}"
     network_mode: "service:gluetun"      # keep traffic inside VPN
     volumes:
       - /DATA/docker/recyclarr:/config   # holds YAML & backups
