@@ -202,15 +202,3 @@ services:
     ports:
       - "5055:5055"
     restart: unless-stopped
-
-  cloudflared:
-    image: cloudflare/cloudflared:2025.5.0
-    container_name: cloudflared
-    restart: unless-stopped
-    command: tunnel run
-    environment:
-      - TUNNEL_TOKEN=${CLOUDFLARED_TUNNEL_TOKEN}
-    volumes:
-      - ./cloudflared:/etc/cloudflared
-    networks:
-      - default
