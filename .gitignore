@@ -1,0 +1,12 @@
+# Ignore everything by default
+/*
+
+# Allow essential repo files
+!.gitignore
+!docker-compose.yml
+!README.md
+!LICENSE
+
+# Never track local environment files
+.env
+.env.*
