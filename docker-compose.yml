@@ -137,14 +137,14 @@ services:
       - TZ=${TZ}
       - UN_SONARR_0_URL=http://sonarr:8989
       - UN_SONARR_0_API_KEY=${SONARR_API_KEY}
-      - UN_SONARR_0_PATH=/downloads
+      - UN_SONARR_0_PATH=/data/downloads
       - UN_RADARR_0_URL=http://radarr:7878
       - UN_RADARR_0_API_KEY=${RADARR_API_KEY}
-      - UN_RADARR_0_PATH=/downloads
+      - UN_RADARR_0_PATH=/data/downloads
       - UN_QBITTORRENT_0_URL=http://gluetun:8080
       - UN_QBITTORRENT_0_USER=${QBITTORRENT_USER}
       - UN_QBITTORRENT_0_PASS=${QBITTORRENT_PASS}
-      - UN_QBITTORRENT_0_PATH=/downloads
+      - UN_QBITTORRENT_0_PATH=/data/downloads
     volumes:
       - /Users/zack/plex-docker/unpackerr:/config
       - /Volumes/HomeLabPool:/data
