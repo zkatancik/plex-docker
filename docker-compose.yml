@@ -192,3 +192,15 @@ services:
     ports:
       - "5055:5055"
     restart: unless-stopped
+
+  # ─── Agregarr (Plex collections manager) ─────────────────────────────
+  agregarr:
+    image: agregarr/agregarr:latest
+    container_name: agregarr
+    environment:
+      - TZ=${TZ}
+    volumes:
+      - /Users/zack/plex-docker/agregarr:/app/config
+    ports:
+      - "7171:7171"
+    restart: unless-stopped
