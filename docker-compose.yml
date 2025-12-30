@@ -193,6 +193,20 @@ services:
       - "5055:5055"
     restart: unless-stopped
 
+  # ─── Tautulli (Plex monitoring) ─────────────────────────────────────
+  tautulli:
+    image: lscr.io/linuxserver/tautulli:latest
+    container_name: tautulli
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    volumes:
+      - /Users/zack/plex-docker/tautulli:/config
+    ports:
+      - "8181:8181"
+    restart: unless-stopped
+
   # ─── Agregarr (Plex collections manager) ─────────────────────────────
   agregarr:
     image: agregarr/agregarr:latest
