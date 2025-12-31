@@ -215,6 +215,8 @@ services:
       - TZ=${TZ}
     volumes:
       - /Users/zack/plex-docker/agregarr:/app/config
+      - /Volumes/HomeLabPool/placeholders/movies:/data/movies
+      - /Volumes/HomeLabPool/placeholders/tv:/data/tv
     ports:
       - "7171:7171"
     restart: unless-stopped
