@@ -126,6 +126,23 @@ services:
       - vpn_net
     restart: unless-stopped
 
+  # ─── Bazarr (Subtitles) ───────────────────────────────────────────────
+  bazarr:
+    image: lscr.io/linuxserver/bazarr:latest
+    container_name: bazarr
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    volumes:
+      - /Users/zack/plex-docker/bazarr:/config
+      - /Volumes/HomeLabPool:/data
+    ports:
+      - "6767:6767"
+    networks:
+      - default
+    restart: unless-stopped
+
   # ─── Unpackerr (Handles compressed downloads) ─────────────────────
   unpackerr:
     image: golift/unpackerr:latest
