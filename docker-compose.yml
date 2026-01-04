@@ -200,9 +200,8 @@ services:
   overseerr:
     image: ghcr.io/seerr-team/seerr:develop
     container_name: overseerr
+    user: "${PUID}:${PGID}"
     environment:
-      - PUID=${PUID}
-      - PGID=${PGID}
       - TZ=${TZ}
     volumes:
       - /Users/zack/plex-docker/overseerr:/app/config
