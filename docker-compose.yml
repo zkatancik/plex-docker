@@ -231,6 +231,7 @@ services:
       - TZ=${TZ}
     volumes:
       - /Users/zack/plex-docker/agregarr:/app/config
+      - /Users/zack/plex-docker/agregarr/yt-dlp.conf:/etc/yt-dlp.conf:ro
       - /Volumes/HomeLabPool/placeholders/movies:/data/movies
       - /Volumes/HomeLabPool/placeholders/tv:/data/tv
     ports:
