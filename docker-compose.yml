@@ -198,7 +198,7 @@ services:
 
   # ─── Seerr (Requests UI) ────────────────────────────────────────────
   overseerr:
-    image: ghcr.io/seerr-team/seerr:develop
+    image: ghcr.io/samohtxotom/seerr:feature-radarr-sonarr-priority
     container_name: overseerr
     user: "${PUID}:${PGID}"
     environment:
