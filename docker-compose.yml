@@ -201,6 +201,8 @@ services:
     image: overseerr:radarr-sonarr-priority
     build:
       context: https://github.com/samohtxotom/seerr.git#feature/radarr-sonarr-priority
+      args:
+        COMMIT_TAG: "local"
     container_name: overseerr
     user: "${PUID}:${PGID}"
     environment:
