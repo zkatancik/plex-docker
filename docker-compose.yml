@@ -12,11 +12,22 @@ services:
     environment:
       - VPN_SERVICE_PROVIDER=protonvpn
       - VPN_TYPE=wireguard
+      # Key + Address must match a WireGuard config from Proton (account.proton.me → VPN → WireGuard).
+      # After regenerating: set WIREGUARD_PRIVATE_KEY and WIREGUARD_ADDRESSES in .env from that file.
+      # Leave Moderate NAT disabled there (conflicts with NAT-PMP / port forwarding per Proton + gluetun wiki).
+      # Use one key only for this Gluetun; do not reuse the same key on another host/container.
       - WIREGUARD_PRIVATE_KEY=${WIREGUARD_PRIVATE_KEY}
-      - WIREGUARD_ADDRESSES=10.2.0.2/32
+      # Interface Address= line from the Proton .conf (e.g. 10.2.0.2/32); default keeps prior compose value.
+      - WIREGUARD_ADDRESSES=${WIREGUARD_ADDRESSES:-10.2.0.2/32}
+      # If Proton’s .conf includes PresharedKey=, add: WIREGUARD_PRESHARED_KEY=... to .env and a line here.
+      # P2P / port-forward servers only (see gluetun ProtonVPN wiki).
+      - PORT_FORWARD_ONLY=on
+      # Lower latency from Texas; PORT_FORWARD_ONLY still limits to P2P / port-forward POPs.
+      # If Gluetun fails to find a server, add fallbacks: United States,Switzerland,Netherlands
+      - SERVER_COUNTRIES=United States
       - TZ=${TZ}
       - DOCKER_VPN_NETWORK=vpn_net
-      - DOCKER_ALLOWED_INCOMING_PORTS=8080,8191,9696
+      - DOCKER_ALLOWED_INCOMING_PORTS=8080,8191
       - PUID=${PUID}
       - PGID=${PGID}
       - VPN_PORT_FORWARDING=on
@@ -24,7 +35,7 @@ services:
       - HEALTH_VPN_DURATION_INITIAL=30s
       - HEALTH_SUCCESS_WAIT_DURATION=5s
       - FIREWALL_DEBUG=on
-      - FIREWALL_INPUT_PORTS=8080,9696,8191
+      - FIREWALL_INPUT_PORTS=8080,8191
       - FIREWALL_OUTBOUND_SUBNETS=${FIREWALL_OUTBOUND_SUBNETS}
       - BLOCK_MALICIOUS=off
       - BLOCK_ADS=off
@@ -34,8 +45,7 @@ services:
       - 127.0.0.11
     ports:
       - "8080:8080/tcp"    # qBittorrent Web UI
-      - "8191:8191"        # flaresolverr
-      - "9696:9696"        # prowlarr
+      - "8191:8191"        # flaresolverr (Prowlarr on bridge reaches this via host.docker.internal:8191)
     volumes:
       - /Users/zack/plex-docker/gluetun:/gluetun
       - /Users/zack/plex-docker/gluetun:/tmp/gluetun 
@@ -182,27 +192,29 @@ services:
     restart: unless-stopped      
 
   # ─── Prowlarr (Indexer manager) ─────────────────────────────────────
+  # Split routing: indexer HTTPS uses your normal network (default), not the VPN.
+  # Prowlarr still hits all *enabled* indexers in parallel—fewer enabled indexers = less burst load.
   prowlarr:
     image: linuxserver/prowlarr
     container_name: prowlarr
-    network_mode: "service:gluetun"
-    depends_on:
-      - gluetun
     environment:
       - PUID=${PUID}
       - PGID=${PGID}
       - TZ=${TZ}
     volumes:
       - /Users/zack/plex-docker/prowlarr:/config
+    ports:
+      - "9696:9696"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - default
+      - vpn_net
     restart: unless-stopped
 
   # ─── Seerr (Requests UI) ────────────────────────────────────────────
   overseerr:
-    image: overseerr:radarr-sonarr-priority
-    build:
-      context: https://github.com/samohtxotom/seerr.git#feature/radarr-sonarr-priority
-      args:
-        COMMIT_TAG: "local"
+    image: ghcr.io/seerr-team/seerr:develop
     container_name: overseerr
     user: "${PUID}:${PGID}"
     environment:
@@ -241,4 +253,19 @@ services:
       - /Volumes/HomeLabPool/placeholders/tv:/data/tv
     ports:
       - "7171:7171"
+    restart: unless-stopped
+
+  # ─── Trailer Post-Processor (watches for new trailers and converts to Apple TV format) ───
+  trailer-processor:
+    image: agregarr/agregarr:latest
+    container_name: trailer-processor
+    depends_on:
+      - agregarr
+    environment:
+      - TZ=${TZ}
+    volumes:
+      - /Users/zack/plex-docker/agregarr:/app/config
+      - /Volumes/HomeLabPool/placeholders/movies:/data/movies
+      - /Volumes/HomeLabPool/placeholders/tv:/data/tv
+    command: sh /app/config/trailer-watcher.sh
     restart: unless-stopped
