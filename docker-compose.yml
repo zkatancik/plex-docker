@@ -31,16 +31,15 @@ services:
       - PUID=${PUID}
       - PGID=${PGID}
       - VPN_PORT_FORWARDING=on
-      - DNS_SERVERS=1.1.1.1,1.0.0.1,8.8.8.8,8.8.4.4
-      - HEALTH_VPN_DURATION_INITIAL=30s
+      # Current Gluetun releases keep the built-in DNS forwarder enabled; use encrypted upstreams.
+      - DNS_UPSTREAM_RESOLVERS=cloudflare,google
       - HEALTH_SUCCESS_WAIT_DURATION=5s
-      - FIREWALL_DEBUG=on
+      - FIREWALL_IPTABLES_LOG_LEVEL=debug
       - FIREWALL_INPUT_PORTS=8080,8191
       - FIREWALL_OUTBOUND_SUBNETS=${FIREWALL_OUTBOUND_SUBNETS}
       - BLOCK_MALICIOUS=off
       - BLOCK_ADS=off
       - BLOCK_SURVEILLANCE=off
-      - DOT=off
     dns:
       - 127.0.0.11
     ports:
@@ -177,6 +176,33 @@ services:
       - /Volumes/HomeLabPool:/data
     restart: unless-stopped
 
+  # ─── Download cleanup (orphaned / superseded completed downloads) ───
+  download-cleanup:
+    image: python:3.12-alpine
+    container_name: download-cleanup
+    depends_on:
+      - qbittorrent
+    environment:
+      - TZ=${TZ}
+      - QBITTORRENT_URL=http://host.docker.internal:8080
+      - QBITTORRENT_USER=${QBITTORRENT_USER}
+      - QBITTORRENT_PASS=${QBITTORRENT_PASS}
+      - DOWNLOADS_PATH=/data/Downloads/complete
+      - MEDIA_TV_PATH=/data/Media/tv
+      - MEDIA_MOVIES_PATH=/data/Media/movies
+    volumes:
+      - /Users/zack/plex-docker/scripts/download-cleanup.py:/scripts/download-cleanup.py:ro
+      - /Volumes/HomeLabPool:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    entrypoint: /bin/sh
+    command: >
+      -c "while true; do
+            python3 /scripts/download-cleanup.py;
+            sleep 21600;
+          done"
+    restart: unless-stopped
+
   # ─── Recyclarr (Autofetch Sonarr and Radarr profiles) ---------------
   recyclarr:
     image: ghcr.io/recyclarr/recyclarr:latest
@@ -214,7 +240,11 @@ services:
 
   # ─── Seerr (Requests UI) ────────────────────────────────────────────
   overseerr:
-    image: ghcr.io/seerr-team/seerr:develop
+    image: overseerr:radarr-sonarr-priority
+    build:
+      context: https://github.com/samohtxotom/seerr.git#feature/radarr-sonarr-priority
+      args:
+        COMMIT_TAG: "local"
     container_name: overseerr
     user: "${PUID}:${PGID}"
     environment:
