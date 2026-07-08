@@ -187,7 +187,7 @@ services:
       - QBITTORRENT_URL=http://host.docker.internal:8080
       - QBITTORRENT_USER=${QBITTORRENT_USER}
       - QBITTORRENT_PASS=${QBITTORRENT_PASS}
-      - DOWNLOADS_PATH=/data/Downloads/complete
+      - DOWNLOADS_PATH=/data/downloads/complete
       - MEDIA_TV_PATH=/data/Media/tv
       - MEDIA_MOVIES_PATH=/data/Media/movies
     volumes:
