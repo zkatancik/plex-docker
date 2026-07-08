@@ -178,12 +178,13 @@ services:
 
   # ─── Download cleanup (orphaned / superseded completed downloads) ───
   download-cleanup:
-    image: python:3.12-alpine
+    image: zkatancik/download-cleanup:latest
     container_name: download-cleanup
     depends_on:
       - qbittorrent
     environment:
       - TZ=${TZ}
+      - CLEANUP_INTERVAL_SECONDS=21600
       - QBITTORRENT_URL=http://host.docker.internal:8080
       - QBITTORRENT_USER=${QBITTORRENT_USER}
       - QBITTORRENT_PASS=${QBITTORRENT_PASS}
@@ -191,16 +192,9 @@ services:
       - MEDIA_TV_PATH=/data/Media/tv
       - MEDIA_MOVIES_PATH=/data/Media/movies
     volumes:
-      - /Users/zack/plex-docker/scripts/download-cleanup.py:/scripts/download-cleanup.py:ro
       - /Volumes/HomeLabPool:/data
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    entrypoint: /bin/sh
-    command: >
-      -c "while true; do
-            python3 /scripts/download-cleanup.py;
-            sleep 21600;
-          done"
     restart: unless-stopped
 
   # ─── Recyclarr (Autofetch Sonarr and Radarr profiles) ---------------

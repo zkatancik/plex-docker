@@ -1,0 +1,8 @@
+**
+!LICENSE
+!scripts/
+!scripts/download-cleanup.py
+!containers/
+!containers/download-cleanup/
+!containers/download-cleanup/Dockerfile
+!containers/download-cleanup/entrypoint.sh

@@ -3,9 +3,19 @@
 
 # Allow essential repo files
 !.gitignore
+!.dockerignore
 !docker-compose.yml
 !README.md
 !LICENSE
+!.github/
+!.github/workflows/
+!.github/workflows/docker-download-cleanup.yml
+!containers/
+!containers/download-cleanup/
+!containers/download-cleanup/**
+!scripts/
+scripts/*
+!scripts/download-cleanup.py
 
 # Never track local environment files
 .env
