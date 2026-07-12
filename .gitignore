@@ -16,6 +16,9 @@
 !scripts/
 scripts/*
 !scripts/download-cleanup.py
+!tests/
+!tests/**
+tests/__pycache__/
 
 # Never track local environment files
 .env
