@@ -3,6 +3,7 @@ set -eu
 
 : "${CLEANUP_INTERVAL_SECONDS:=21600}"
 : "${RETENTION_GUARD_INTERVAL_SECONDS:=60}"
+: "${QUEUE_RECONCILE_INTERVAL_SECONDS:=900}"
 
 if [ "${1:-}" = "once" ]; then
   shift
@@ -11,6 +12,7 @@ fi
 
 guard_failures=0
 next_cleanup=0
+next_queue_reconcile=0
 while true; do
   guard_dry_run=""
   for arg in "$@"; do
@@ -31,6 +33,14 @@ while true; do
   fi
 
   now=$(date +%s)
+  if [ "$now" -ge "$next_queue_reconcile" ]; then
+    if /usr/local/bin/download-cleanup --reconcile-queue ${guard_dry_run}; then
+      next_queue_reconcile=$((now + QUEUE_RECONCILE_INTERVAL_SECONDS))
+    else
+      echo "Arr queue reconciliation failed; retrying after ${RETENTION_GUARD_INTERVAL_SECONDS}s" >&2
+    fi
+  fi
+
   if [ "$now" -ge "$next_cleanup" ]; then
     if /usr/local/bin/download-cleanup "$@"; then
       next_cleanup=$((now + CLEANUP_INTERVAL_SECONDS))

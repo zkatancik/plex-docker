@@ -10,6 +10,7 @@ Rules:
 - Quarantine unexpectedly unmatched payloads for 30 days, then clean them.
 - Skip torrents that are still actively managed for seeding after the minimum window.
 - Keep Arr removal disabled so this worker is the authoritative retention decision.
+- Detach terminal, superseded Sonarr and Radarr queue warnings while preserving seeding.
 - After 30 days, remove download-folder copies of fully-hardlinked content that *arr missed
   (media hardlinks survive; declutters Downloads/complete, does not free disk space).
 """
@@ -118,6 +119,7 @@ RELEASE_SIDECAR_EXTS = {
 RELEASE_RESIDUE_EXTS = ARCHIVE_EXTS | RELEASE_SIDECAR_EXTS
 SEED_MIN_SECONDS = int(os.environ.get("MIN_SEED_TIME_SECONDS", 30 * 24 * 3600))
 SEED_MIN_MINUTES = (SEED_MIN_SECONDS + 59) // 60
+MAX_ACTIVE_DOWNLOADS = int(os.environ.get("MAX_ACTIVE_DOWNLOADS", 3))
 UNMATCHED_GRACE_SECONDS = int(os.environ.get("UNMATCHED_GRACE_SECONDS", 30 * 24 * 3600))
 STATE_VERSION = 1
 EARLY_STOP_STATES = {"stoppedUP", "pausedUP"}
@@ -126,6 +128,24 @@ TRACKER_REMOVED_MESSAGES = (
     "torrent is not registered",
     "torrent not registered",
     "unregistered torrent",
+)
+SONARR_TERMINAL_QUEUE_REASONS = (
+    "invalid season or episode",
+    "not a quality revision upgrade for existing episode file(s)",
+    "not an upgrade for existing episode file(s)",
+    "one or more episodes expected in this release were not imported or missing from the release",
+)
+RADARR_TERMINAL_QUEUE_REASONS = (
+    "invalid movie",
+    "movie file already imported",
+    "not a quality revision upgrade for existing movie file(s)",
+    "one or more movies expected in this release were not imported or missing",
+    "unable to parse file",
+)
+RADARR_TERMINAL_QUEUE_REASON_PREFIXES = (
+    "movie file already imported at ",
+    "not a custom format upgrade for existing movie file(s). ",
+    "not an upgrade for existing movie file. existing quality: ",
 )
 
 DEFAULTS = {
@@ -137,6 +157,15 @@ DEFAULTS = {
     "qb_pass": os.environ.get("QBITTORRENT_PASS", ""),
     "sonarr_url": os.environ.get("SONARR_URL", ""),
     "sonarr_api_key": os.environ.get("SONARR_API_KEY", ""),
+    "sonarr_detached_category": os.environ.get(
+        "SONARR_DETACHED_CATEGORY", "sonarr-rejected"
+    ),
+    "radarr_detached_category": os.environ.get(
+        "RADARR_DETACHED_CATEGORY", "radarr-rejected"
+    ),
+    "queue_reconcile_grace_seconds": int(
+        os.environ.get("QUEUE_RECONCILE_GRACE_SECONDS", 30 * 60)
+    ),
     "radarr_url": os.environ.get("RADARR_URL", ""),
     "radarr_api_key": os.environ.get("RADARR_API_KEY", ""),
     "state_path": os.environ.get("RETENTION_STATE_PATH", "/state/retention-state.json"),
@@ -393,6 +422,10 @@ class QBittorrent:
         with self.opener.open(f"{self.base_url}/api/v2/app/preferences", timeout=30) as resp:
             return json.loads(resp.read().decode())
 
+    def categories(self) -> dict:
+        with self.opener.open(f"{self.base_url}/api/v2/torrents/categories", timeout=30) as resp:
+            return json.loads(resp.read().decode())
+
     def post(self, path: str, values: dict[str, object]) -> None:
         data = urllib.parse.urlencode(values).encode()
         req = urllib.request.Request(f"{self.base_url}{path}", data=data)
@@ -401,6 +434,16 @@ class QBittorrent:
 
     def set_preferences(self, values: dict[str, object]) -> None:
         self.post("/api/v2/app/setPreferences", {"json": json.dumps(values)})
+
+    def create_category(self, category: str) -> None:
+        self.post("/api/v2/torrents/createCategory", {"category": category})
+
+    def set_category(self, hashes: list[str], category: str) -> None:
+        if hashes:
+            self.post(
+                "/api/v2/torrents/setCategory",
+                {"hashes": "|".join(hashes), "category": category},
+            )
 
     def set_share_limits(
         self,
@@ -469,6 +512,249 @@ class ArrApi:
 
     def update_download_client(self, client: dict) -> None:
         self.request(f"/api/v3/downloadclient/{client['id']}", method="PUT", payload=client)
+
+    def queue(self, query: str) -> list[dict]:
+        result = self.request(f"/api/v3/queue?{query}")
+        if not isinstance(result, dict):
+            return []
+        records = result.get("records", [])
+        return records if isinstance(records, list) else []
+
+    def managed_item(self, resource: str, item_id: int) -> dict:
+        result = self.request(f"/api/v3/{resource}/{item_id}")
+        return result if isinstance(result, dict) else {}
+
+
+def qbit_categories_from_arr(api: ArrApi, category_field: str) -> set[str]:
+    """Return non-empty categories owned by enabled Arr qBittorrent clients."""
+    categories: set[str] = set()
+    for client in api.download_clients():
+        if client.get("implementation") != "QBittorrent" or not client.get("enable", True):
+            continue
+        for field in client.get("fields", []):
+            if field.get("name") == category_field and field.get("value"):
+                categories.add(str(field["value"]))
+    return categories
+
+
+def queue_rejection_reasons(record: dict) -> set[str]:
+    """Flatten an Arr app's file-level queue messages into normalized reasons."""
+    reasons: set[str] = set()
+    for status in record.get("statusMessages", []):
+        messages = [str(message).strip() for message in status.get("messages", []) if message]
+        if messages:
+            reasons.update(message.lower() for message in messages)
+        elif status.get("title"):
+            reasons.add(str(status["title"]).strip().lower())
+    return reasons
+
+
+def is_terminal_arr_queue_record(
+    record: dict,
+    allowed_reasons: tuple[str, ...],
+    allowed_prefixes: tuple[str, ...] = (),
+) -> bool:
+    """Recognize only warnings that cannot succeed on a later automatic retry."""
+    if (
+        record.get("status") != "completed"
+        or record.get("trackedDownloadStatus") != "warning"
+        or record.get("trackedDownloadState") not in {"importPending", "importBlocked"}
+    ):
+        return False
+    reasons = queue_rejection_reasons(record)
+    return bool(reasons) and all(
+        reason in allowed_reasons or reason.startswith(allowed_prefixes)
+        for reason in reasons
+    )
+
+
+def terminal_arr_queue_groups(
+    records: list[dict],
+    torrents: list[dict],
+    existing_item_ids: set[int],
+    source_categories: set[str],
+    item_id_field: str,
+    allowed_reasons: tuple[str, ...],
+    allowed_prefixes: tuple[str, ...],
+    now: int,
+    grace_seconds: int,
+) -> list[tuple[dict, list[dict]]]:
+    """Return fail-closed torrent/queue groups safe to detach from an Arr app."""
+    grouped: dict[str, list[dict]] = {}
+    for record in records:
+        download_id = str(record.get("downloadId", "")).lower()
+        if download_id:
+            grouped.setdefault(download_id, []).append(record)
+
+    torrents_by_hash = {
+        str(torrent.get("hash", "")).lower(): torrent
+        for torrent in torrents
+        if torrent.get("hash")
+    }
+    candidates: list[tuple[dict, list[dict]]] = []
+    for download_id, group in grouped.items():
+        torrent = torrents_by_hash.get(download_id)
+        item_ids = {int(record.get(item_id_field, 0)) for record in group}
+        completed_on = int(torrent.get("completion_on", 0)) if torrent else 0
+        if (
+            not torrent
+            or torrent.get("progress", 0) < 1
+            or torrent.get("category") not in source_categories
+            or completed_on <= 0
+            or now - completed_on < grace_seconds
+            or not item_ids
+            or 0 in item_ids
+            or not item_ids.issubset(existing_item_ids)
+            or not all(
+                is_terminal_arr_queue_record(record, allowed_reasons, allowed_prefixes)
+                for record in group
+            )
+        ):
+            continue
+        candidates.append((torrent, group))
+    return candidates
+
+
+def reconcile_arr_queue(
+    qb: QBittorrent,
+    dry_run: bool,
+    label: str,
+    base_url: str,
+    api_key: str,
+    detached_category: str,
+    category_field: str,
+    item_id_field: str,
+    item_resource: str,
+    queue_query: str,
+    allowed_reasons: tuple[str, ...],
+    allowed_prefixes: tuple[str, ...],
+    grace_seconds: int,
+) -> int:
+    """Move one Arr app's terminal warnings aside without deleting qBit data."""
+    detached_category = detached_category.strip()
+    if not detached_category:
+        print(f"{label} detached category must not be empty", file=sys.stderr)
+        return 1
+
+    try:
+        api = ArrApi(base_url, api_key)
+        source_categories = qbit_categories_from_arr(api, category_field)
+        if not source_categories or detached_category in source_categories:
+            print(
+                f"Refusing queue reconciliation because {label} categories are unsafe",
+                file=sys.stderr,
+            )
+            return 1
+
+        records = api.queue(queue_query)
+        item_ids = {
+            int(record.get(item_id_field, 0))
+            for record in records
+            if record.get(item_id_field)
+        }
+        existing_item_ids = {
+            item_id
+            for item_id in item_ids
+            if api.managed_item(item_resource, item_id).get("hasFile")
+        }
+        candidates = terminal_arr_queue_groups(
+            records,
+            qb.torrents(),
+            existing_item_ids,
+            source_categories,
+            item_id_field,
+            allowed_reasons,
+            allowed_prefixes,
+            int(time.time()),
+            grace_seconds,
+        )
+    except Exception as exc:
+        print(f"{label} queue reconciliation failed: {exc}", file=sys.stderr)
+        return 1
+
+    mode = "DRY RUN" if dry_run else "EXECUTED"
+    print(f"=== {label} queue reconciliation ({mode}) ===")
+    if not candidates:
+        print("No terminal queue warnings to detach")
+        return 0
+
+    if not dry_run:
+        try:
+            if detached_category not in qb.categories():
+                qb.create_category(detached_category)
+            qb.set_category([torrent["hash"] for torrent, _ in candidates], detached_category)
+        except Exception as exc:
+            print(f"Failed to detach {label} queue torrents: {exc}", file=sys.stderr)
+            return 1
+
+    for torrent, group in candidates:
+        reasons = sorted({reason for record in group for reason in queue_rejection_reasons(record)})
+        print(
+            f"DETACH    {torrent.get('name', torrent['hash'])[:80]} "
+            f"({len(group)} queue row(s); {'; '.join(reasons)}) -> {detached_category}"
+        )
+    return 0
+
+
+def reconcile_arr_queues(dry_run: bool) -> int:
+    """Reconcile Sonarr and Radarr independently, failing closed for either app."""
+    cfg = DEFAULTS.copy()
+    if not cfg["qb_user"] or not cfg["qb_pass"]:
+        print("Set QBITTORRENT_USER and QBITTORRENT_PASS", file=sys.stderr)
+        return 1
+
+    try:
+        qb = QBittorrent(cfg["qb_url"], cfg["qb_user"], cfg["qb_pass"])
+    except Exception as exc:
+        print(f"Queue reconciliation could not connect to qBittorrent: {exc}", file=sys.stderr)
+        return 1
+
+    apps = (
+        {
+            "label": "Sonarr",
+            "base_url": cfg["sonarr_url"],
+            "api_key": cfg["sonarr_api_key"],
+            "detached_category": cfg["sonarr_detached_category"],
+            "category_field": "tvCategory",
+            "item_id_field": "episodeId",
+            "item_resource": "episode",
+            "queue_query": (
+                "page=1&pageSize=1000&includeUnknownSeriesItems=true"
+                "&includeSeries=false&includeEpisode=false"
+            ),
+            "allowed_reasons": SONARR_TERMINAL_QUEUE_REASONS,
+            "allowed_prefixes": (),
+        },
+        {
+            "label": "Radarr",
+            "base_url": cfg["radarr_url"],
+            "api_key": cfg["radarr_api_key"],
+            "detached_category": cfg["radarr_detached_category"],
+            "category_field": "movieCategory",
+            "item_id_field": "movieId",
+            "item_resource": "movie",
+            "queue_query": (
+                "page=1&pageSize=1000&includeUnknownMovieItems=true&includeMovie=false"
+            ),
+            "allowed_reasons": RADARR_TERMINAL_QUEUE_REASONS,
+            "allowed_prefixes": RADARR_TERMINAL_QUEUE_REASON_PREFIXES,
+        },
+    )
+
+    failed = False
+    for app in apps:
+        if not app["base_url"] or not app["api_key"]:
+            print(f"{app['label']} queue reconciliation is not configured", file=sys.stderr)
+            failed = True
+            continue
+        result = reconcile_arr_queue(
+            qb=qb,
+            dry_run=dry_run,
+            grace_seconds=int(cfg["queue_reconcile_grace_seconds"]),
+            **app,
+        )
+        failed = failed or result != 0
+    return 1 if failed else 0
 
 
 def is_seeding(torrent: dict | None) -> bool:
@@ -641,7 +927,7 @@ def declutter_linked_folder(
 
 
 def required_preference_updates(preferences: dict) -> dict[str, object]:
-    """Keep global qBit share limits from ending a torrent before the minimum."""
+    """Keep retention safe and bound concurrent downloads without limiting uploads."""
     updates: dict[str, object] = {}
     current_limit = int(preferences.get("max_seeding_time", -1))
     if not preferences.get("max_seeding_time_enabled"):
@@ -654,6 +940,17 @@ def required_preference_updates(preferences: dict) -> dict[str, object]:
         updates["max_inactive_seeding_time_enabled"] = False
     if preferences.get("max_ratio_act") != 0:
         updates["max_ratio_act"] = 0
+    if MAX_ACTIVE_DOWNLOADS > 0:
+        if not preferences.get("queueing_enabled"):
+            updates["queueing_enabled"] = True
+        if int(preferences.get("max_active_downloads", -1)) != MAX_ACTIVE_DOWNLOADS:
+            updates["max_active_downloads"] = MAX_ACTIVE_DOWNLOADS
+        # Keep every completed torrent eligible to seed. Queueing is used only
+        # to limit simultaneous downloads, not upload availability.
+        if int(preferences.get("max_active_uploads", -1)) != -1:
+            updates["max_active_uploads"] = -1
+        if int(preferences.get("max_active_torrents", -1)) != -1:
+            updates["max_active_torrents"] = -1
     return updates
 
 
@@ -1032,6 +1329,11 @@ def main() -> int:
         help="Normalize qBittorrent share limits and restart completed torrents stopped before 30 days",
     )
     parser.add_argument(
+        "--reconcile-queue",
+        action="store_true",
+        help="Detach terminal Sonarr/Radarr warnings while preserving qBittorrent data",
+    )
+    parser.add_argument(
         "--include-seeding",
         action="store_true",
         help="Remove active orphans only after the hard minimum seed window (default: skip)",
@@ -1039,6 +1341,8 @@ def main() -> int:
     args = parser.parse_args()
     if args.guard:
         return guard_retention(dry_run=args.dry_run)
+    if args.reconcile_queue:
+        return reconcile_arr_queues(dry_run=args.dry_run)
     return run(dry_run=args.dry_run, include_seeding=args.include_seeding)
 
 

@@ -1,0 +1,40 @@
+# yaml-language-server: $schema=https://schemas.recyclarr.dev/latest/config-schema.json
+
+# Recyclarr intentionally owns only the custom formats declared here. Existing
+# quality membership, cutoffs, scores for other formats, and file-size limits
+# remain unchanged.
+sonarr:
+  television:
+    base_url: !env_var SONARR_URL http://sonarr:8989
+    api_key: !env_var SONARR_API_KEY
+    delete_old_custom_formats: false
+    custom_formats:
+      - trash_ids:
+          - 85c61753df5da1fb2aab6f2a47426b09 # BR-DISK
+        assign_scores_to:
+          - name: 1080p HQ
+            score: -10000
+          - name: 4K HDR Preferred
+            score: -10000
+          - name: WEB-2160p
+            score: -10000
+          - name: WEB-1080p
+            score: -10000
+
+radarr:
+  movies:
+    base_url: !env_var RADARR_URL http://radarr:7878
+    api_key: !env_var RADARR_API_KEY
+    delete_old_custom_formats: false
+    custom_formats:
+      - trash_ids:
+          - ed38b889b31be83fda192888e2286d83 # BR-DISK
+        assign_scores_to:
+          - name: 1080p HQ
+            score: -10000
+          - name: 4K HDR Preferred
+            score: -10000
+          - name: UHD Bluray + WEB
+            score: -10000
+          - name: Remux + WEB 1080p
+            score: -10000

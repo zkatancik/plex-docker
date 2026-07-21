@@ -70,6 +70,12 @@ services:
     volumes:
       - /Volumes/HomeLabPool:/data
       - /Users/zack/plex-docker/qbittorrent:/config
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "--max-time", "10", "http://127.0.0.1:8080/api/v2/app/version"]
+      interval: 1m
+      timeout: 15s
+      retries: 3
+      start_period: 45s
     restart: unless-stopped
 
   flaresolverr:
@@ -79,6 +85,12 @@ services:
     environment:
       - LOG_LEVEL=info
       - TZ=${TZ}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "--max-time", "10", "http://127.0.0.1:8191/health"]
+      interval: 1m
+      timeout: 15s
+      retries: 3
+      start_period: 30s
     restart: unless-stopped
 
   qb-port-sync:
@@ -97,6 +109,12 @@ services:
       - QBITTORRENT_PASSWORD=${QBITTORRENT_PASS}
     volumes:
       - /Users/zack/plex-docker/gluetun:/tmp/gluetun:ro
+    healthcheck:
+      test: ["CMD-SHELL", "test -s /tmp/gluetun/forwarded_port && pgrep -f '/bin/bash ./start.sh' >/dev/null"]
+      interval: 1m
+      timeout: 10s
+      retries: 3
+      start_period: 45s
     restart: unless-stopped
 
   # ─── Sonarr (TV shows) ────────────────────────────────────────────────
@@ -115,6 +133,12 @@ services:
     networks:
       - default
       - vpn_net
+    healthcheck:
+      test: ["CMD-SHELL", "api_key=$$(grep -o '<ApiKey>[^<]*' /config/config.xml | cut -d '>' -f2) && test -n \"$$api_key\" && curl -fsS --max-time 10 -H \"X-Api-Key: $$api_key\" http://127.0.0.1:8989/api/v3/health | jq -e 'length == 0' >/dev/null"]
+      interval: 1m
+      timeout: 15s
+      retries: 3
+      start_period: 1m
     restart: unless-stopped
 
   # ─── Radarr (Movies) ──────────────────────────────────────────────────
@@ -133,6 +157,12 @@ services:
     networks:
       - default
       - vpn_net
+    healthcheck:
+      test: ["CMD-SHELL", "api_key=$$(grep -o '<ApiKey>[^<]*' /config/config.xml | cut -d '>' -f2) && test -n \"$$api_key\" && curl -fsS --max-time 10 -H \"X-Api-Key: $$api_key\" http://127.0.0.1:7878/api/v3/health | jq -e 'length == 0' >/dev/null"]
+      interval: 1m
+      timeout: 15s
+      retries: 3
+      start_period: 1m
     restart: unless-stopped
 
   # ─── Bazarr (Subtitles) ───────────────────────────────────────────────
@@ -150,6 +180,12 @@ services:
       - "6767:6767"
     networks:
       - default
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "--max-time", "10", "http://127.0.0.1:6767/"]
+      interval: 1m
+      timeout: 15s
+      retries: 3
+      start_period: 1m
     restart: unless-stopped
 
   # ─── Unpackerr (Handles compressed downloads) ─────────────────────
@@ -167,13 +203,16 @@ services:
       - UN_RADARR_0_URL=http://radarr:7878
       - UN_RADARR_0_API_KEY=${RADARR_API_KEY}
       - UN_RADARR_0_PATH=/data/downloads
-      - UN_QBITTORRENT_0_URL=http://gluetun:8080
-      - UN_QBITTORRENT_0_USER=${QBITTORRENT_USER}
-      - UN_QBITTORRENT_0_PASS=${QBITTORRENT_PASS}
-      - UN_QBITTORRENT_0_PATH=/data/downloads
     volumes:
       - /Users/zack/plex-docker/unpackerr:/config
       - /Volumes/HomeLabPool:/data
+    healthcheck:
+      # /proc reports the full process name; pgrep truncates it on this image.
+      test: ["CMD-SHELL", "test \"$$(cat /proc/1/comm)\" = unpackerr"]
+      interval: 1m
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     restart: unless-stopped
 
   # ─── Download cleanup (orphaned / superseded completed downloads) ───
@@ -189,7 +228,12 @@ services:
       - TZ=${TZ}
       - CLEANUP_INTERVAL_SECONDS=21600
       - RETENTION_GUARD_INTERVAL_SECONDS=60
+      - QUEUE_RECONCILE_INTERVAL_SECONDS=900
+      - QUEUE_RECONCILE_GRACE_SECONDS=1800
+      - SONARR_DETACHED_CATEGORY=sonarr-rejected
+      - RADARR_DETACHED_CATEGORY=radarr-rejected
       - MIN_SEED_TIME_SECONDS=2592000
+      - MAX_ACTIVE_DOWNLOADS=3
       - UNMATCHED_GRACE_SECONDS=2592000
       - RETENTION_STATE_PATH=/state/retention-state.json
       - QBITTORRENT_URL=http://host.docker.internal:8080
@@ -219,17 +263,29 @@ services:
 
   # ─── Recyclarr (Autofetch Sonarr and Radarr profiles) ---------------
   recyclarr:
-    image: ghcr.io/recyclarr/recyclarr:latest
+    image: ghcr.io/recyclarr/recyclarr:8
     container_name: recyclarr
     user: "${PUID}:${PGID}"
     networks:
       - default
     volumes:
       - /Users/zack/plex-docker/recyclarr:/config   # holds YAML & backups
+      - /Users/zack/plex-docker/containers/recyclarr/cron.sh:/cron.sh:ro
     environment:
       - TZ=America/Chicago
       - CRON_SCHEDULE= 0 3,15 * * *
-    restart: unless-stopped      
+      - SONARR_URL=http://sonarr:8989
+      - SONARR_API_KEY=${SONARR_API_KEY}
+      - RADARR_URL=http://radarr:7878
+      - RADARR_API_KEY=${RADARR_API_KEY}
+    healthcheck:
+      # Keep this read-only: Recyclarr config commands update the Trash Guides Git checkout.
+      test: ["CMD-SHELL", "test -s /config/state/last-sync-success && now=$$(date +%s) && last=$$(cat /config/state/last-sync-success) && test $$((now - last)) -lt 46800"]
+      interval: 1m
+      timeout: 1m
+      retries: 2
+      start_period: 5m
+    restart: unless-stopped
 
   # ─── Prowlarr (Indexer manager) ─────────────────────────────────────
   # Split routing: indexer HTTPS uses your normal network (default), not the VPN.
@@ -250,15 +306,22 @@ services:
     networks:
       - default
       - vpn_net
+    healthcheck:
+      test: ["CMD-SHELL", "api_key=$$(grep -o '<ApiKey>[^<]*' /config/config.xml | cut -d '>' -f2) && test -n \"$$api_key\" && curl -fsS --max-time 10 -H \"X-Api-Key: $$api_key\" http://127.0.0.1:9696/api/v1/health | jq -e 'length == 0' >/dev/null"]
+      interval: 1m
+      timeout: 15s
+      retries: 3
+      start_period: 1m
     restart: unless-stopped
 
   # ─── Seerr (Requests UI) ────────────────────────────────────────────
   overseerr:
     image: overseerr:radarr-sonarr-priority
     build:
-      context: https://github.com/samohtxotom/seerr.git#feature/radarr-sonarr-priority
+      # Seerr develop + Radarr/Sonarr availability priority compatibility fix.
+      context: https://github.com/samohtxotom/seerr.git#ddc87450da16d246f206cd102d0f92d6c59b2498
       args:
-        COMMIT_TAG: "local"
+        COMMIT_TAG: "ddc87450"
     container_name: overseerr
     user: "${PUID}:${PGID}"
     environment:
@@ -268,6 +331,12 @@ services:
       - /Users/zack/plex-docker/overseerr:/app/config
     ports:
       - "5055:5055"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-T", "10", "-O", "/dev/null", "http://127.0.0.1:5055/api/v1/status"]
+      interval: 1m
+      timeout: 15s
+      retries: 3
+      start_period: 1m
     restart: unless-stopped
 
   # ─── Tautulli (Plex monitoring) ─────────────────────────────────────
@@ -282,11 +351,20 @@ services:
       - /Users/zack/plex-docker/tautulli:/config
     ports:
       - "8181:8181"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "--max-time", "10", "http://127.0.0.1:8181/status"]
+      interval: 1m
+      timeout: 15s
+      retries: 3
+      start_period: 1m
     restart: unless-stopped
 
   # ─── Agregarr (Plex collections manager) ─────────────────────────────
   agregarr:
-    image: agregarr/agregarr:latest
+    image: agregarr-hardened:local
+    build:
+      context: .
+      dockerfile: containers/agregarr/Dockerfile
     container_name: agregarr
     environment:
       - TZ=${TZ}
@@ -297,11 +375,17 @@ services:
       - /Volumes/HomeLabPool/placeholders/tv:/data/tv
     ports:
       - "7171:7171"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-T", "10", "-O", "/dev/null", "http://127.0.0.1:7171/api/v1/status"]
+      interval: 1m
+      timeout: 15s
+      retries: 3
+      start_period: 1m
     restart: unless-stopped
 
   # ─── Trailer Post-Processor (watches for new trailers and converts to Apple TV format) ───
   trailer-processor:
-    image: agregarr/agregarr:latest
+    image: agregarr-hardened:local
     container_name: trailer-processor
     depends_on:
       - agregarr
@@ -312,4 +396,10 @@ services:
       - /Volumes/HomeLabPool/placeholders/movies:/data/movies
       - /Volumes/HomeLabPool/placeholders/tv:/data/tv
     command: sh /app/config/trailer-watcher.sh
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f '/app/config/trailer-watcher.sh' >/dev/null"]
+      interval: 1m
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     restart: unless-stopped

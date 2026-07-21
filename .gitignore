@@ -20,6 +20,14 @@ scripts/*
 !tests/**
 tests/__pycache__/
 
+# Track the non-secret Recyclarr policy while leaving its runtime cache,
+# logs, state, and any local secrets ignored.
+!recyclarr/
+recyclarr/*
+!recyclarr/configs/
+recyclarr/configs/*
+!recyclarr/configs/media.yml
+
 # Never track local environment files
 .env
 .env.*

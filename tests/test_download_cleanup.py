@@ -223,6 +223,25 @@ class CleanupRunTests(unittest.TestCase):
 
 
 class ShareLimitTests(unittest.TestCase):
+    def test_queueing_limits_downloads_without_limiting_seeding(self):
+        updates = download_cleanup.required_preference_updates(
+            {
+                "max_seeding_time_enabled": True,
+                "max_seeding_time": download_cleanup.SEED_MIN_MINUTES,
+                "max_ratio_enabled": False,
+                "max_inactive_seeding_time_enabled": False,
+                "max_ratio_act": 0,
+                "queueing_enabled": False,
+                "max_active_downloads": 8,
+                "max_active_uploads": 3,
+                "max_active_torrents": 5,
+            }
+        )
+        self.assertTrue(updates["queueing_enabled"])
+        self.assertEqual(download_cleanup.MAX_ACTIVE_DOWNLOADS, updates["max_active_downloads"])
+        self.assertEqual(-1, updates["max_active_uploads"])
+        self.assertEqual(-1, updates["max_active_torrents"])
+
     def test_global_preferences_disable_early_ratio_and_inactivity_stops(self):
         updates = download_cleanup.required_preference_updates(
             {
@@ -344,6 +363,240 @@ class ArrRetentionTests(unittest.TestCase):
                 "Radarr", "http://radarr:7878", "key", dry_run=True
             )
         api.update_download_client.assert_not_called()
+
+
+class SonarrQueueReconciliationTests(unittest.TestCase):
+    @staticmethod
+    def record(message="Invalid season or episode", episode_id=101):
+        return {
+            "downloadId": "ABC123",
+            "episodeId": episode_id,
+            "status": "completed",
+            "trackedDownloadStatus": "warning",
+            "trackedDownloadState": "importPending",
+            "statusMessages": [{"title": "00000.m2ts", "messages": [message]}],
+        }
+
+    @staticmethod
+    def torrent(now=1_000_000):
+        return {
+            "hash": "abc123",
+            "name": "disc release",
+            "category": "sonarr",
+            "progress": 1,
+            "completion_on": now - 3600,
+        }
+
+    def test_only_explicit_terminal_reasons_are_eligible(self):
+        self.assertTrue(
+            download_cleanup.is_terminal_arr_queue_record(
+                self.record(), download_cleanup.SONARR_TERMINAL_QUEUE_REASONS
+            )
+        )
+        self.assertFalse(
+            download_cleanup.is_terminal_arr_queue_record(
+                self.record("Access to the path is denied"),
+                download_cleanup.SONARR_TERMINAL_QUEUE_REASONS,
+            )
+        )
+
+    def test_candidate_requires_existing_episode_and_grace_period(self):
+        now = 1_000_000
+        record = self.record()
+        torrent = self.torrent(now)
+        candidates = download_cleanup.terminal_arr_queue_groups(
+            [record], [torrent], {101}, {"sonarr"}, "episodeId",
+            download_cleanup.SONARR_TERMINAL_QUEUE_REASONS, (), now, 1800
+        )
+        self.assertEqual([(torrent, [record])], candidates)
+
+        self.assertEqual(
+            [],
+            download_cleanup.terminal_arr_queue_groups(
+                [record], [torrent], set(), {"sonarr"}, "episodeId",
+                download_cleanup.SONARR_TERMINAL_QUEUE_REASONS, (), now, 1800
+            ),
+        )
+        torrent["completion_on"] = now - 60
+        self.assertEqual(
+            [],
+            download_cleanup.terminal_arr_queue_groups(
+                [record], [torrent], {101}, {"sonarr"}, "episodeId",
+                download_cleanup.SONARR_TERMINAL_QUEUE_REASONS, (), now, 1800
+            ),
+        )
+
+    def test_reconcile_moves_category_without_deleting_torrent(self):
+        api = mock.Mock()
+        api.download_clients.return_value = [
+            {
+                "enable": True,
+                "implementation": "QBittorrent",
+                "fields": [{"name": "tvCategory", "value": "sonarr"}],
+            }
+        ]
+        api.queue.return_value = [self.record()]
+        api.managed_item.return_value = {"hasFile": True}
+
+        qb = mock.Mock()
+        qb.torrents.return_value = [self.torrent(now=1_000_000)]
+        qb.categories.return_value = {}
+        with (
+            mock.patch.object(download_cleanup, "ArrApi", return_value=api),
+            mock.patch.object(download_cleanup.time, "time", return_value=1_000_000),
+            mock.patch("sys.stdout"),
+        ):
+            result = download_cleanup.reconcile_arr_queue(
+                qb, False, "Sonarr", "http://sonarr", "key", "sonarr-rejected",
+                "tvCategory", "episodeId", "episode",
+                "page=1&includeUnknownSeriesItems=true",
+                download_cleanup.SONARR_TERMINAL_QUEUE_REASONS, (), 1800,
+            )
+
+        self.assertEqual(0, result)
+        qb.create_category.assert_called_once_with("sonarr-rejected")
+        qb.set_category.assert_called_once_with(["abc123"], "sonarr-rejected")
+        qb.delete_torrents.assert_not_called()
+
+    def test_dry_run_never_changes_qbittorrent(self):
+        api = mock.Mock()
+        api.download_clients.return_value = [
+            {
+                "enable": True,
+                "implementation": "QBittorrent",
+                "fields": [{"name": "tvCategory", "value": "sonarr"}],
+            }
+        ]
+        api.queue.return_value = [self.record()]
+        api.managed_item.return_value = {"hasFile": True}
+        qb = mock.Mock()
+        qb.torrents.return_value = [self.torrent(now=1_000_000)]
+        with (
+            mock.patch.object(download_cleanup, "ArrApi", return_value=api),
+            mock.patch.object(download_cleanup.time, "time", return_value=1_000_000),
+            mock.patch("sys.stdout"),
+        ):
+            result = download_cleanup.reconcile_arr_queue(
+                qb, True, "Sonarr", "http://sonarr", "key", "sonarr-rejected",
+                "tvCategory", "episodeId", "episode",
+                "page=1&includeUnknownSeriesItems=true",
+                download_cleanup.SONARR_TERMINAL_QUEUE_REASONS, (), 1800,
+            )
+
+        self.assertEqual(0, result)
+        qb.create_category.assert_not_called()
+        qb.set_category.assert_not_called()
+
+
+class RadarrQueueReconciliationTests(unittest.TestCase):
+    @staticmethod
+    def record(message="Invalid movie"):
+        return {
+            "downloadId": "MOVIE123",
+            "movieId": 202,
+            "status": "completed",
+            "trackedDownloadStatus": "warning",
+            "trackedDownloadState": "importBlocked",
+            "statusMessages": [{"title": "00000.m2ts", "messages": [message]}],
+        }
+
+    def test_radarr_terminal_prefixes_are_explicit_and_permission_errors_remain(self):
+        lower_quality = (
+            "Not an upgrade for existing movie file. Existing quality: Bluray-2160p. "
+            "New Quality WEBDL-2160p."
+        )
+        self.assertTrue(
+            download_cleanup.is_terminal_arr_queue_record(
+                self.record(lower_quality),
+                download_cleanup.RADARR_TERMINAL_QUEUE_REASONS,
+                download_cleanup.RADARR_TERMINAL_QUEUE_REASON_PREFIXES,
+            )
+        )
+        self.assertFalse(
+            download_cleanup.is_terminal_arr_queue_record(
+                self.record("Access to the path is denied"),
+                download_cleanup.RADARR_TERMINAL_QUEUE_REASONS,
+                download_cleanup.RADARR_TERMINAL_QUEUE_REASON_PREFIXES,
+            )
+        )
+
+    def test_radarr_uses_movie_api_and_separate_rejected_category(self):
+        api = mock.Mock()
+        api.download_clients.return_value = [
+            {
+                "enable": True,
+                "implementation": "QBittorrent",
+                "fields": [{"name": "movieCategory", "value": "radarr"}],
+            }
+        ]
+        api.queue.return_value = [self.record()]
+        api.managed_item.return_value = {"hasFile": True}
+
+        qb = mock.Mock()
+        qb.torrents.return_value = [
+            {
+                "hash": "movie123",
+                "name": "disc movie",
+                "category": "radarr",
+                "progress": 1,
+                "completion_on": 1_000_000 - 3600,
+            }
+        ]
+        qb.categories.return_value = {"sonarr-rejected": {}}
+        query = "page=1&pageSize=1000&includeUnknownMovieItems=true&includeMovie=false"
+        with (
+            mock.patch.object(download_cleanup, "ArrApi", return_value=api),
+            mock.patch.object(download_cleanup.time, "time", return_value=1_000_000),
+            mock.patch("sys.stdout"),
+        ):
+            result = download_cleanup.reconcile_arr_queue(
+                qb, False, "Radarr", "http://radarr", "key", "radarr-rejected",
+                "movieCategory", "movieId", "movie", query,
+                download_cleanup.RADARR_TERMINAL_QUEUE_REASONS,
+                download_cleanup.RADARR_TERMINAL_QUEUE_REASON_PREFIXES, 1800,
+            )
+
+        self.assertEqual(0, result)
+        api.queue.assert_called_once_with(query)
+        api.managed_item.assert_called_once_with("movie", 202)
+        qb.create_category.assert_called_once_with("radarr-rejected")
+        qb.set_category.assert_called_once_with(["movie123"], "radarr-rejected")
+        qb.delete_torrents.assert_not_called()
+
+    def test_combined_reconciler_invokes_sonarr_and_radarr(self):
+        qb = mock.Mock()
+        calls = []
+
+        def capture(**kwargs):
+            calls.append(kwargs)
+            return 0
+
+        with (
+            mock.patch.dict(
+                download_cleanup.DEFAULTS,
+                {
+                    "qb_url": "http://qbit",
+                    "qb_user": "user",
+                    "qb_pass": "pass",
+                    "sonarr_url": "http://sonarr",
+                    "sonarr_api_key": "sonarr-key",
+                    "sonarr_detached_category": "sonarr-rejected",
+                    "radarr_url": "http://radarr",
+                    "radarr_api_key": "radarr-key",
+                    "radarr_detached_category": "radarr-rejected",
+                    "queue_reconcile_grace_seconds": 1800,
+                },
+            ),
+            mock.patch.object(download_cleanup, "QBittorrent", return_value=qb),
+            mock.patch.object(download_cleanup, "reconcile_arr_queue", side_effect=capture),
+        ):
+            result = download_cleanup.reconcile_arr_queues(dry_run=True)
+
+        self.assertEqual(0, result)
+        self.assertEqual(["Sonarr", "Radarr"], [call["label"] for call in calls])
+        self.assertEqual("movieCategory", calls[1]["category_field"])
+        self.assertEqual("movieId", calls[1]["item_id_field"])
+        self.assertEqual("movie", calls[1]["item_resource"])
 
 
 class TorrentMatchingTests(unittest.TestCase):
