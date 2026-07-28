@@ -171,6 +171,45 @@ class UnmatchedQuarantineTests(unittest.TestCase):
 
 
 class CleanupRunTests(unittest.TestCase):
+    def run_with_managed_release(self, torrent_fields):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            downloads = root / "complete"
+            media_tv = root / "tv"
+            media_movies = root / "movies"
+            for path in (downloads, media_tv, media_movies):
+                path.mkdir()
+
+            release = downloads / "superseded-release.mkv"
+            release.write_bytes(b"release payload")
+            state_path = root / "state.json"
+            torrent = {
+                "hash": "original-hash",
+                "name": release.name,
+                "content_path": str(release),
+                "save_path": str(downloads),
+                **torrent_fields,
+            }
+
+            fake_qb = mock.Mock()
+            fake_qb.torrents.return_value = [torrent]
+            config = {
+                "downloads": str(downloads),
+                "media_tv": str(media_tv),
+                "media_movies": str(media_movies),
+                "state_path": str(state_path),
+                "qb_url": "http://qbit",
+                "qb_user": "user",
+                "qb_pass": "pass",
+            }
+            with (
+                mock.patch.dict(download_cleanup.DEFAULTS, config),
+                mock.patch.object(download_cleanup, "QBittorrent", return_value=fake_qb),
+                mock.patch("sys.stdout"),
+            ):
+                result = download_cleanup.run(dry_run=False, include_seeding=False)
+            return result, release.exists(), fake_qb
+
     def run_with_unmatched_age(self, age_seconds):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)
@@ -220,6 +259,22 @@ class CleanupRunTests(unittest.TestCase):
         result, exists = self.run_with_unmatched_age(download_cleanup.UNMATCHED_GRACE_SECONDS + 60)
         self.assertEqual(0, result)
         self.assertFalse(exists)
+
+    def test_superseded_stopped_torrent_is_not_deleted_before_seed_window(self):
+        result, exists, fake_qb = self.run_with_managed_release(
+            {"progress": 1, "seeding_time": 20 * 3600, "state": "stoppedUP"}
+        )
+        self.assertEqual(0, result)
+        self.assertTrue(exists)
+        fake_qb.delete_torrents.assert_not_called()
+
+    def test_startup_transitional_torrent_is_not_deleted(self):
+        result, exists, fake_qb = self.run_with_managed_release(
+            {"progress": 0, "seeding_time": 0, "state": "checkingResumeData"}
+        )
+        self.assertEqual(0, result)
+        self.assertTrue(exists)
+        fake_qb.delete_torrents.assert_not_called()
 
 
 class ShareLimitTests(unittest.TestCase):
