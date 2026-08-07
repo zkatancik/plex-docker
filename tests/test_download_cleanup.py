@@ -1,4 +1,5 @@
 import importlib.util
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -652,6 +653,319 @@ class RadarrQueueReconciliationTests(unittest.TestCase):
         self.assertEqual("movieCategory", calls[1]["category_field"])
         self.assertEqual("movieId", calls[1]["item_id_field"])
         self.assertEqual("movie", calls[1]["item_resource"])
+
+
+class UnmonitoredScopeTests(unittest.TestCase):
+    def test_sonarr_unmonitored_season_selects_only_that_seasons_files(self):
+        api = mock.Mock()
+
+        def resources(resource, query=""):
+            if resource == "series":
+                return [
+                    {
+                        "id": 7,
+                        "title": "Example",
+                        "path": "/data/Media/tv/Example",
+                        "monitored": True,
+                        "seasons": [
+                            {"seasonNumber": 1, "monitored": True},
+                            {"seasonNumber": 2, "monitored": False},
+                        ],
+                    }
+                ]
+            if resource == "episodefile":
+                return [
+                    {"id": 10, "seasonNumber": 1, "path": "/data/Media/tv/Example/Season 01/a.mkv"},
+                    {"id": 20, "seasonNumber": 2, "path": "/data/Media/tv/Example/Season 02/b.mkv"},
+                ]
+            if resource == "episode":
+                return [
+                    {"id": 101, "seasonNumber": 1, "episodeFileId": 10},
+                    {"id": 201, "seasonNumber": 2, "episodeFileId": 20},
+                ]
+            return []
+
+        api.resources.side_effect = resources
+        scopes = download_cleanup.sonarr_eviction_scopes(api)
+        self.assertEqual(1, len(scopes))
+        self.assertEqual("season", scopes[0]["kind"])
+        self.assertEqual(2, scopes[0]["season_number"])
+        self.assertEqual({20}, scopes[0]["file_ids"])
+        self.assertEqual({201}, scopes[0]["episode_ids"])
+
+    def test_sonarr_unmonitored_series_supersedes_season_scopes(self):
+        api = mock.Mock()
+        api.resources.side_effect = lambda resource, query="": {
+            "series": [
+                {
+                    "id": 7,
+                    "title": "Example",
+                    "path": "/data/Media/tv/Example",
+                    "monitored": False,
+                    "seasons": [{"seasonNumber": 1, "monitored": False}],
+                }
+            ],
+            "episodefile": [
+                {"id": 10, "seasonNumber": 1, "path": "/data/Media/tv/Example/Season 01/a.mkv"}
+            ],
+            "episode": [{"id": 101, "seasonNumber": 1, "episodeFileId": 10}],
+        }.get(resource, [])
+        scopes = download_cleanup.sonarr_eviction_scopes(api)
+        self.assertEqual(["series"], [scope["kind"] for scope in scopes])
+        self.assertEqual({10}, scopes[0]["file_ids"])
+
+    def test_radarr_monitored_movie_is_not_a_candidate(self):
+        api = mock.Mock()
+        api.resources.return_value = [{"id": 1, "monitored": True}]
+        self.assertEqual([], download_cleanup.radarr_eviction_scopes(api))
+
+    def test_radarr_unmonitored_movie_selects_its_movie_file(self):
+        api = mock.Mock()
+        api.resources.side_effect = lambda resource, query="": {
+            "movie": [
+                {
+                    "id": 8,
+                    "title": "Example",
+                    "path": "/data/Media/movies/Example",
+                    "monitored": False,
+                }
+            ],
+            "moviefile": [
+                {"id": 80, "path": "/data/Media/movies/Example/movie.mkv"}
+            ],
+        }.get(resource, [])
+        scopes = download_cleanup.radarr_eviction_scopes(api)
+        self.assertEqual(1, len(scopes))
+        self.assertEqual("movie", scopes[0]["kind"])
+        self.assertEqual({80}, scopes[0]["file_ids"])
+
+    def test_arr_bulk_file_deletion_uses_the_expected_payload(self):
+        api = object.__new__(download_cleanup.ArrApi)
+        api.request = mock.Mock()
+        api.delete_files("episodefile", "episodeFileIds", [1, 2])
+        api.request.assert_called_once_with(
+            "/api/v3/episodefile/bulk",
+            method="DELETE",
+            payload={"episodeFileIds": [1, 2]},
+        )
+
+    def test_history_association_survives_a_broken_hardlink(self):
+        scope = {
+            "app": "Radarr",
+            "kind": "movie",
+            "owner_id": 8,
+            "file_ids": {50},
+            "file_paths": {Path("/data/Media/movies/Example/new-inode.mkv")},
+            "episode_ids": set(),
+        }
+        history = [
+            {
+                "movieId": 8,
+                "downloadId": "ABC123",
+                "data": {
+                    "fileId": "50",
+                    "droppedPath": "/data/downloads/complete/release.mkv",
+                },
+            }
+        ]
+        download_cleanup.associate_scope_downloads(
+            scope,
+            history,
+            [],
+            {},
+            Path("/data/downloads/complete"),
+            {"abc123"},
+        )
+        self.assertEqual({"abc123"}, scope["torrent_hashes"])
+        self.assertEqual({"release.mkv"}, scope["download_top_levels"])
+
+    def test_season_cleanup_never_removes_a_directory_with_other_season_files(self):
+        with tempfile.TemporaryDirectory() as root_value:
+            root = Path(root_value) / "Series"
+            mixed = root / "Mixed"
+            mixed.mkdir(parents=True)
+            target = mixed / "season-2.mkv"
+            other = mixed / "season-1.mkv"
+            target.touch()
+            other.touch()
+            scope = {
+                "owner_path": root,
+                "file_paths": {target},
+                "all_file_paths": {target, other},
+            }
+            self.assertEqual(set(), download_cleanup.season_cleanup_dirs(scope))
+
+
+class UnmonitoredEvictionTests(unittest.TestCase):
+    def test_stale_media_mutation_lock_is_recovered(self):
+        with tempfile.TemporaryDirectory() as root_value:
+            path = Path(root_value) / "locks/media.lock"
+            path.mkdir(parents=True)
+            old = download_cleanup.time.time() - 10
+            os.utime(path, (old, old))
+            with download_cleanup.media_mutation_lock(path, stale_seconds=1):
+                self.assertTrue(path.is_dir())
+            self.assertFalse(path.exists())
+
+    def run_sonarr_eviction(self, seed_time, *, dry_run=False, lock_busy=False):
+        with tempfile.TemporaryDirectory() as root_value:
+            root = Path(root_value)
+            downloads = root / "downloads" / "complete"
+            media_tv = root / "Media" / "tv"
+            media_movies = root / "Media" / "movies"
+            series_path = media_tv / "Example"
+            season_path = series_path / "Season 02"
+            for path in (downloads, season_path, media_movies):
+                path.mkdir(parents=True)
+            payload = downloads / "release.mkv"
+            payload.write_bytes(b"episode")
+            library_file = season_path / "episode.mkv"
+            os.link(payload, library_file)
+            lock_path = root / ".locks" / "media.lock"
+            if lock_busy:
+                lock_path.mkdir(parents=True)
+
+            sonarr = mock.Mock()
+
+            def sonarr_resources(resource, query=""):
+                if resource == "series":
+                    return [
+                        {
+                            "id": 7,
+                            "title": "Example",
+                            "path": str(series_path),
+                            "monitored": True,
+                            "seasons": [
+                                {"seasonNumber": 1, "monitored": True},
+                                {"seasonNumber": 2, "monitored": False},
+                            ],
+                        }
+                    ]
+                if resource == "episodefile":
+                    return [
+                        {
+                            "id": 20,
+                            "seasonNumber": 2,
+                            "path": str(library_file),
+                            "relativePath": "Season 02/episode.mkv",
+                        }
+                    ]
+                if resource == "episode":
+                    return [{"id": 201, "seasonNumber": 2, "episodeFileId": 20}]
+                return []
+
+            sonarr.resources.side_effect = sonarr_resources
+            sonarr.history.return_value = [
+                {
+                    "seriesId": 7,
+                    "episodeId": 201,
+                    "downloadId": "ABC123",
+                    "data": {"fileId": "20", "droppedPath": str(payload)},
+                }
+            ]
+            sonarr.queue.return_value = []
+            sonarr.managed_item.return_value = {
+                "id": 7,
+                "monitored": True,
+                "seasons": [{"seasonNumber": 2, "monitored": False}],
+            }
+
+            radarr = mock.Mock()
+            radarr.resources.return_value = []
+            radarr.history.return_value = []
+            radarr.queue.return_value = []
+            qb = mock.Mock()
+            torrent = {
+                "hash": "abc123",
+                "name": payload.name,
+                "content_path": str(payload),
+                "save_path": str(downloads),
+                "progress": 1,
+                "seeding_time": seed_time,
+                "state": "stoppedUP",
+            }
+            cfg = {
+                **download_cleanup.DEFAULTS,
+                "downloads": str(downloads),
+                "media_tv": str(media_tv),
+                "media_movies": str(media_movies),
+                "sonarr_url": "http://sonarr",
+                "sonarr_api_key": "sonarr-key",
+                "radarr_url": "http://radarr",
+                "radarr_api_key": "radarr-key",
+                "unmonitored_eviction_enabled": True,
+                "media_mutation_lock_path": str(lock_path),
+                "normalizer_state_path": str(root / "normalizer-state.json"),
+                "normalizer_host_pool_path": str(root),
+            }
+            with mock.patch.object(
+                download_cleanup,
+                "ArrApi",
+                side_effect=lambda url, key: sonarr if "sonarr" in url else radarr,
+            ):
+                result = download_cleanup.evict_unmonitored_media(
+                    cfg,
+                    qb,
+                    [torrent],
+                    download_cleanup.empty_retention_state(),
+                    downloads,
+                    dry_run,
+                )
+            return result, library_file.exists(), season_path.exists(), qb, sonarr
+
+    def test_under_seeded_season_is_left_completely_untouched(self):
+        result, file_exists, directory_exists, qb, sonarr = self.run_sonarr_eviction(
+            download_cleanup.SEED_MIN_SECONDS - 1
+        )
+        actions, changed, failed = result
+        self.assertTrue(any("EVICT-WAIT" in action for action in actions))
+        self.assertFalse(changed)
+        self.assertFalse(failed)
+        self.assertTrue(file_exists)
+        self.assertTrue(directory_exists)
+        qb.stop_torrents.assert_not_called()
+        sonarr.delete_files.assert_not_called()
+
+    def test_eligible_season_files_are_evicted_but_arr_entry_is_retained(self):
+        result, file_exists, directory_exists, qb, sonarr = self.run_sonarr_eviction(
+            download_cleanup.SEED_MIN_SECONDS
+        )
+        actions, changed, failed = result
+        self.assertTrue(any(action.startswith("EVICT      ") for action in actions))
+        self.assertTrue(changed)
+        self.assertFalse(failed)
+        self.assertFalse(file_exists)
+        self.assertFalse(directory_exists)
+        qb.stop_torrents.assert_called_once_with(["abc123"])
+        sonarr.delete_files.assert_called_once_with("episodefile", "episodeFileIds", [20])
+        sonarr.delete.assert_not_called()
+
+    def test_dry_run_does_not_stop_or_delete_anything(self):
+        result, file_exists, directory_exists, qb, sonarr = self.run_sonarr_eviction(
+            download_cleanup.SEED_MIN_SECONDS,
+            dry_run=True,
+        )
+        actions, changed, failed = result
+        self.assertTrue(any("WOULD EVICT" in action for action in actions))
+        self.assertFalse(changed)
+        self.assertFalse(failed)
+        self.assertTrue(file_exists)
+        self.assertTrue(directory_exists)
+        qb.stop_torrents.assert_not_called()
+        sonarr.delete_files.assert_not_called()
+
+    def test_busy_media_mutation_lock_defers_the_whole_phase(self):
+        result, file_exists, _, qb, sonarr = self.run_sonarr_eviction(
+            download_cleanup.SEED_MIN_SECONDS,
+            lock_busy=True,
+        )
+        actions, changed, failed = result
+        self.assertEqual(["EVICT-WAIT media normalizer is mutating the library"], actions)
+        self.assertFalse(changed)
+        self.assertFalse(failed)
+        self.assertTrue(file_exists)
+        qb.stop_torrents.assert_not_called()
+        sonarr.delete_files.assert_not_called()
 
 
 class TorrentMatchingTests(unittest.TestCase):

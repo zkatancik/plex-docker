@@ -236,6 +236,11 @@ services:
       - MAX_ACTIVE_DOWNLOADS=3
       - UNMATCHED_GRACE_SECONDS=2592000
       - RETENTION_STATE_PATH=/state/retention-state.json
+      - UNMONITORED_EVICTION_ENABLED=true
+      - MEDIA_MUTATION_LOCK_PATH=/data/.automation-locks/media-library-mutation.lock
+      - MEDIA_MUTATION_LOCK_STALE_SECONDS=300
+      - MEDIA_NORMALIZER_STATE_PATH=/media-normalizer-state/state.json
+      - MEDIA_NORMALIZER_HOST_POOL_PATH=/Volumes/HomeLabPool
       - QBITTORRENT_URL=http://host.docker.internal:8080
       - QBITTORRENT_USER=${QBITTORRENT_USER}
       - QBITTORRENT_PASS=${QBITTORRENT_PASS}
@@ -248,6 +253,7 @@ services:
       - MEDIA_MOVIES_PATH=/data/Media/movies
     volumes:
       - /Users/zack/plex-docker/download-cleanup:/state
+      - /Users/zack/plex-docker/media-normalizer:/media-normalizer-state:ro
       - /Volumes/HomeLabPool:/data
     extra_hosts:
       - "host.docker.internal:host-gateway"
