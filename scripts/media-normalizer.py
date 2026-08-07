@@ -22,6 +22,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -42,6 +43,9 @@ HDR_TRANSFERS = {"smpte2084", "arib-std-b67"}
 HDR_PRIMARIES = {"bt2020"}
 RETRYABLE_STATUSES = {"blocked", "error", "interrupted"}
 NORMALIZABLE_SIGNATURES = {"av1", "hfr", "incomplete_hvcc"}
+MEDIA_MUTATION_LOCK_STALE_SECONDS = int(
+    os.environ.get("MEDIA_MUTATION_LOCK_STALE_SECONDS", "300")
+)
 PROFILE_NAMES = {
     "sonarr": ["1080p HQ", "4K HDR Preferred", "WEB-2160p", "WEB-1080p"],
     "radarr": [
@@ -74,12 +78,17 @@ class LockBusy(NormalizerError):
     """Another normalizer process owns the lock."""
 
 
+class MediaMutationLockBusy(NormalizerError):
+    """Another worker is mutating the shared media library."""
+
+
 @dataclass
 class Settings:
     repo_root: Path
     env_path: Path
     state_path: Path
     lock_path: Path
+    media_mutation_lock_path: Path
     rollback_root: Path
     ffmpeg: str
     ffprobe: str
@@ -172,6 +181,12 @@ def load_settings(repo_root: Optional[Path] = None) -> Settings:
         env_path=env_path,
         state_path=runtime / "state.json",
         lock_path=runtime / "normalizer.lock",
+        media_mutation_lock_path=Path(
+            os.environ.get(
+                "MEDIA_MUTATION_LOCK_PATH",
+                "/Volumes/HomeLabPool/.automation-locks/media-library-mutation.lock",
+            )
+        ),
         rollback_root=Path(
             os.environ.get(
                 "MEDIA_NORMALIZER_ROLLBACK_ROOT",
@@ -319,6 +334,54 @@ def process_lock(path: Path) -> Iterator[None]:
             yield
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def media_mutation_lock(
+    path: Path, stale_seconds: int = MEDIA_MUTATION_LOCK_STALE_SECONDS
+) -> Iterator[None]:
+    """Coordinate host and container mutations through an atomic directory."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    acquired = False
+    for _ in range(2):
+        try:
+            path.mkdir()
+            acquired = True
+            break
+        except FileExistsError as exc:
+            try:
+                age = time.time() - path.stat().st_mtime
+                if stale_seconds <= 0 or age <= stale_seconds:
+                    raise MediaMutationLockBusy(
+                        "another worker is mutating the media library"
+                    ) from exc
+                path.rmdir()
+            except MediaMutationLockBusy:
+                raise
+            except (FileNotFoundError, OSError) as cleanup_exc:
+                raise MediaMutationLockBusy(
+                    "another worker is mutating the media library"
+                ) from cleanup_exc
+    if not acquired:
+        raise MediaMutationLockBusy("another worker is mutating the media library")
+
+    stop_heartbeat = threading.Event()
+    interval = max(1.0, min(30.0, stale_seconds / 3 if stale_seconds > 0 else 30.0))
+
+    def heartbeat() -> None:
+        while not stop_heartbeat.wait(interval):
+            with contextlib.suppress(FileNotFoundError):
+                os.utime(path, None)
+
+    heartbeat_thread = threading.Thread(target=heartbeat, daemon=True)
+    heartbeat_thread.start()
+    try:
+        yield
+    finally:
+        stop_heartbeat.set()
+        heartbeat_thread.join(timeout=interval + 1)
+        with contextlib.suppress(FileNotFoundError):
+            path.rmdir()
 
 
 def run_process(
@@ -1697,19 +1760,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         with process_lock(settings.lock_path):
             if args.command == "audit":
                 return run_audit(settings, json_output=args.json)
-            if args.command == "poll":
-                return run_poll(settings, dry_run=args.dry_run)
             if args.command == "sync-policy":
                 return run_sync_policy(settings, verify_only=args.verify_only)
-            if args.path is not None:
-                return run_normalize_path(settings, args.path, dry_run=args.dry_run)
-            return run_normalize_season(
-                settings,
-                args.sonarr_series_id,
-                args.season,
-                dry_run=args.dry_run,
-            )
-    except LockBusy as exc:
+            if args.command == "poll" and args.dry_run:
+                return run_poll(settings, dry_run=args.dry_run)
+            if args.command == "normalize" and args.dry_run:
+                if args.path is not None:
+                    return run_normalize_path(settings, args.path, dry_run=True)
+                return run_normalize_season(
+                    settings,
+                    args.sonarr_series_id,
+                    args.season,
+                    dry_run=True,
+                )
+            with media_mutation_lock(settings.media_mutation_lock_path):
+                if args.command == "poll":
+                    return run_poll(settings, dry_run=False)
+                if args.path is not None:
+                    return run_normalize_path(settings, args.path, dry_run=False)
+                return run_normalize_season(
+                    settings,
+                    args.sonarr_series_id,
+                    args.season,
+                    dry_run=False,
+                )
+    except (LockBusy, MediaMutationLockBusy) as exc:
         log(str(exc), settings, stderr=True)
         return 75
     except (NormalizerError, OSError) as exc:

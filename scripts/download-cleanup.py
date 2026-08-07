@@ -11,6 +11,7 @@ Rules:
 - Skip torrents that are still actively managed for seeding after the minimum window.
 - Keep Arr removal disabled so this worker is the authoritative retention decision.
 - Detach terminal, superseded Sonarr and Radarr queue warnings while preserving seeding.
+- Evict files for unmonitored Sonarr series/seasons and Radarr movies after retention.
 - After 30 days, remove download-folder copies of fully-hardlinked content that *arr missed
   (media hardlinks survive; declutters Downloads/complete, does not free disk space).
 """
@@ -18,6 +19,7 @@ Rules:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import http.cookiejar
 import json
 import os
@@ -25,10 +27,12 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
+from typing import Iterator
 
 VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".m4v", ".wmv", ".ts"}
 ARCHIVE_EXTS = {
@@ -122,6 +126,7 @@ SEED_MIN_MINUTES = (SEED_MIN_SECONDS + 59) // 60
 MAX_ACTIVE_DOWNLOADS = int(os.environ.get("MAX_ACTIVE_DOWNLOADS", 3))
 UNMATCHED_GRACE_SECONDS = int(os.environ.get("UNMATCHED_GRACE_SECONDS", 30 * 24 * 3600))
 STATE_VERSION = 1
+TRUE_VALUES = {"1", "true", "yes", "on"}
 EARLY_STOP_STATES = {"stoppedUP", "pausedUP"}
 TRACKER_REMOVED_MESSAGES = (
     "torrent has been deleted",
@@ -169,6 +174,22 @@ DEFAULTS = {
     "radarr_url": os.environ.get("RADARR_URL", ""),
     "radarr_api_key": os.environ.get("RADARR_API_KEY", ""),
     "state_path": os.environ.get("RETENTION_STATE_PATH", "/state/retention-state.json"),
+    "unmonitored_eviction_enabled": os.environ.get(
+        "UNMONITORED_EVICTION_ENABLED", "false"
+    ).lower()
+    in TRUE_VALUES,
+    "media_mutation_lock_path": os.environ.get(
+        "MEDIA_MUTATION_LOCK_PATH", "/data/.automation-locks/media-library-mutation.lock"
+    ),
+    "media_mutation_lock_stale_seconds": int(
+        os.environ.get("MEDIA_MUTATION_LOCK_STALE_SECONDS", "300")
+    ),
+    "normalizer_state_path": os.environ.get(
+        "MEDIA_NORMALIZER_STATE_PATH", "/media-normalizer-state/state.json"
+    ),
+    "normalizer_host_pool_path": os.environ.get(
+        "MEDIA_NORMALIZER_HOST_POOL_PATH", "/Volumes/HomeLabPool"
+    ),
 }
 
 
@@ -178,6 +199,69 @@ def fmt_size(num: int) -> str:
             return f"{num:.1f}{unit}"
         num /= 1024
     return f"{num:.1f}PB"
+
+
+class MediaMutationLockBusy(RuntimeError):
+    pass
+
+
+@contextlib.contextmanager
+def media_mutation_lock(path: Path, stale_seconds: int = 300) -> Iterator[None]:
+    """Coordinate host and container media mutations using an atomic directory."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    acquired = False
+    for _ in range(2):
+        try:
+            path.mkdir()
+            acquired = True
+            break
+        except FileExistsError as exc:
+            try:
+                age = time.time() - path.stat().st_mtime
+                if stale_seconds <= 0 or age <= stale_seconds:
+                    raise MediaMutationLockBusy(str(path)) from exc
+                path.rmdir()
+            except MediaMutationLockBusy:
+                raise
+            except (FileNotFoundError, OSError) as cleanup_exc:
+                raise MediaMutationLockBusy(str(path)) from cleanup_exc
+    if not acquired:
+        raise MediaMutationLockBusy(str(path))
+
+    stop_heartbeat = threading.Event()
+    interval = max(1.0, min(30.0, stale_seconds / 3 if stale_seconds > 0 else 30.0))
+
+    def heartbeat() -> None:
+        while not stop_heartbeat.wait(interval):
+            with contextlib.suppress(FileNotFoundError):
+                os.utime(path, None)
+
+    heartbeat_thread = threading.Thread(target=heartbeat, daemon=True)
+    heartbeat_thread.start()
+    try:
+        yield
+    finally:
+        stop_heartbeat.set()
+        heartbeat_thread.join(timeout=interval + 1)
+        try:
+            path.rmdir()
+        except FileNotFoundError:
+            pass
+
+
+def is_strict_child(path: Path, root: Path) -> bool:
+    try:
+        return path.resolve().relative_to(root.resolve()) != Path(".")
+    except (OSError, ValueError):
+        return False
+
+
+def download_top_level_from_path(path: str | Path, downloads: Path) -> str | None:
+    try:
+        relative = Path(path).relative_to(downloads)
+    except ValueError:
+        return None
+    return relative.parts[0] if relative.parts else None
 
 
 def du(path: Path) -> int:
@@ -505,6 +589,43 @@ class ArrApi:
         with urllib.request.urlopen(request, timeout=60) as response:
             body = response.read()
         return json.loads(body) if body else None
+
+    def resources(self, resource: str, query: str = "") -> list[dict]:
+        suffix = f"?{query}" if query else ""
+        result = self.request(f"/api/v3/{resource}{suffix}")
+        return result if isinstance(result, list) else []
+
+    def delete_files(self, resource: str, id_field: str, file_ids: list[int]) -> None:
+        if file_ids:
+            self.request(
+                f"/api/v3/{resource}/bulk",
+                method="DELETE",
+                payload={id_field: file_ids},
+            )
+
+    def history(self) -> list[dict]:
+        records: list[dict] = []
+        page = 1
+        while True:
+            query = urllib.parse.urlencode(
+                {
+                    "page": page,
+                    "pageSize": 1000,
+                    "sortKey": "date",
+                    "sortDirection": "descending",
+                }
+            )
+            result = self.request(f"/api/v3/history?{query}")
+            if not isinstance(result, dict):
+                break
+            batch = result.get("records", [])
+            if not isinstance(batch, list) or not batch:
+                break
+            records.extend(batch)
+            if len(records) >= int(result.get("totalRecords", len(records))):
+                break
+            page += 1
+        return records
 
     def download_clients(self) -> list[dict]:
         result = self.request("/api/v3/downloadclient")
@@ -876,6 +997,528 @@ def matched_torrents(
     return list(matches.values())
 
 
+def path_is_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def int_value(value: object) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def arr_media_path(owner_path: Path, media: dict) -> Path | None:
+    raw_path = media.get("path")
+    if raw_path:
+        return Path(raw_path)
+    relative = media.get("relativePath")
+    return owner_path / relative if relative else None
+
+
+def sonarr_eviction_scopes(api: ArrApi) -> list[dict]:
+    scopes: list[dict] = []
+    for series in api.resources("series"):
+        unmonitored_seasons = {
+            int(season["seasonNumber"])
+            for season in series.get("seasons", [])
+            if season.get("seasonNumber") is not None and not season.get("monitored", False)
+        }
+        if series.get("monitored", False) and not unmonitored_seasons:
+            continue
+
+        series_id = int(series["id"])
+        series_path = Path(series.get("path", ""))
+        query = urllib.parse.urlencode({"seriesId": series_id})
+        files = api.resources("episodefile", query)
+        episodes = api.resources("episode", query)
+        episode_seasons = {
+            int(episode["id"]): int(episode.get("seasonNumber", -1))
+            for episode in episodes
+            if episode.get("id") is not None
+        }
+        file_seasons: dict[int, int] = {}
+        for media in files:
+            file_id = int(media["id"])
+            season_number = media.get("seasonNumber")
+            if season_number is None:
+                matching_episode = next(
+                    (
+                        episode
+                        for episode in episodes
+                        if int(episode.get("episodeFileId", 0)) == file_id
+                    ),
+                    {},
+                )
+                season_number = matching_episode.get("seasonNumber", -1)
+            file_seasons[file_id] = int(season_number)
+
+        all_file_paths = {
+            path
+            for media in files
+            if (path := arr_media_path(series_path, media)) is not None
+        }
+        common = {
+            "app": "Sonarr",
+            "resource": "series",
+            "owner_id": series_id,
+            "title": str(series.get("title", f"series {series_id}")),
+            "owner_path": series_path,
+            "all_file_paths": all_file_paths,
+        }
+        if not series.get("monitored", False):
+            scopes.append(
+                {
+                    **common,
+                    "kind": "series",
+                    "label": "series",
+                    "season_number": None,
+                    "file_ids": {int(media["id"]) for media in files},
+                    "file_paths": all_file_paths,
+                    "episode_ids": set(episode_seasons),
+                }
+            )
+            continue
+
+        for season_number in sorted(unmonitored_seasons):
+            season_files = [
+                media
+                for media in files
+                if file_seasons.get(int(media["id"])) == season_number
+            ]
+            scopes.append(
+                {
+                    **common,
+                    "kind": "season",
+                    "label": f"season {season_number}",
+                    "season_number": season_number,
+                    "file_ids": {int(media["id"]) for media in season_files},
+                    "file_paths": {
+                        path
+                        for media in season_files
+                        if (path := arr_media_path(series_path, media)) is not None
+                    },
+                    "episode_ids": {
+                        episode_id
+                        for episode_id, number in episode_seasons.items()
+                        if number == season_number
+                    },
+                }
+            )
+    return scopes
+
+
+def radarr_eviction_scopes(api: ArrApi) -> list[dict]:
+    scopes: list[dict] = []
+    for movie in api.resources("movie"):
+        if movie.get("monitored", False):
+            continue
+        movie_id = int(movie["id"])
+        movie_path = Path(movie.get("path", ""))
+        query = urllib.parse.urlencode({"movieId": movie_id})
+        files = api.resources("moviefile", query)
+        file_paths = {
+            path
+            for media in files
+            if (path := arr_media_path(movie_path, media)) is not None
+        }
+        scopes.append(
+            {
+                "app": "Radarr",
+                "resource": "movie",
+                "kind": "movie",
+                "label": "movie",
+                "owner_id": movie_id,
+                "title": str(movie.get("title", f"movie {movie_id}")),
+                "owner_path": movie_path,
+                "file_ids": {int(media["id"]) for media in files},
+                "file_paths": file_paths,
+                "all_file_paths": file_paths,
+                "episode_ids": set(),
+                "season_number": None,
+            }
+        )
+    return scopes
+
+
+def scope_matches_arr_record(scope: dict, record: dict) -> bool:
+    if scope["app"] == "Radarr":
+        return int_value(record.get("movieId")) == scope["owner_id"]
+    if scope["kind"] == "series":
+        return int_value(record.get("seriesId")) == scope["owner_id"] or int_value(
+            record.get("episodeId")
+        ) in scope["episode_ids"]
+    file_id = str(record.get("data", {}).get("fileId", ""))
+    return int_value(record.get("episodeId")) in scope["episode_ids"] or (
+        file_id.isdigit() and int(file_id) in scope["file_ids"]
+    )
+
+
+def index_download_inodes(downloads: Path) -> dict[int, set[str]]:
+    indexed: dict[int, set[str]] = {}
+    for top_level in downloads.iterdir():
+        paths = [top_level] if top_level.is_file() else top_level.rglob("*")
+        for path in paths:
+            try:
+                if path.is_file():
+                    indexed.setdefault(path.stat().st_ino, set()).add(top_level.name)
+            except OSError:
+                pass
+    return indexed
+
+
+def associate_scope_downloads(
+    scope: dict,
+    history: list[dict],
+    queue: list[dict],
+    inode_downloads: dict[int, set[str]],
+    downloads: Path,
+    live_hashes: set[str],
+) -> None:
+    hashes: set[str] = set()
+    top_levels: set[str] = set()
+    for record in [*history, *queue]:
+        if not scope_matches_arr_record(scope, record):
+            continue
+        download_id = str(record.get("downloadId", "")).lower()
+        if download_id in live_hashes:
+            hashes.add(download_id)
+        dropped_path = record.get("data", {}).get("droppedPath")
+        if dropped_path:
+            top_level = download_top_level_from_path(dropped_path, downloads)
+            if top_level:
+                top_levels.add(top_level)
+
+    for media_path in scope["file_paths"]:
+        try:
+            top_levels.update(inode_downloads.get(media_path.stat().st_ino, set()))
+        except OSError:
+            pass
+    scope["torrent_hashes"] = hashes
+    scope["download_top_levels"] = top_levels
+
+
+def map_normalizer_path(raw_path: str, host_pool: Path, container_pool: Path) -> Path:
+    path = Path(raw_path)
+    try:
+        relative = path.relative_to(host_pool)
+    except ValueError:
+        return path
+    return container_pool / relative
+
+
+def load_normalizer_rollbacks(
+    state_path: Path, host_pool: Path, container_pool: Path
+) -> list[dict]:
+    if not state_path.exists():
+        return []
+    errors: list[str] = []
+    for candidate in (state_path, state_path.with_suffix(state_path.suffix + ".bak")):
+        if not candidate.exists():
+            continue
+        try:
+            state = json.loads(candidate.read_text())
+            rollbacks = state.get("rollbacks", [])
+            if not isinstance(rollbacks, list):
+                raise ValueError("normalizer rollbacks are malformed")
+            return [
+                {
+                    **rollback,
+                    "source_path": map_normalizer_path(
+                        str(rollback.get("source_path", "")), host_pool, container_pool
+                    ),
+                    "path": map_normalizer_path(
+                        str(rollback.get("path", "")), host_pool, container_pool
+                    ),
+                }
+                for rollback in rollbacks
+                if not rollback.get("retired_at")
+                and rollback.get("source_path")
+                and rollback.get("path")
+            ]
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            errors.append(f"{candidate}: {exc}")
+    raise RuntimeError("Unable to load media-normalizer state: " + "; ".join(errors))
+
+
+def scope_rollbacks(scope: dict, rollbacks: list[dict]) -> list[dict]:
+    if scope["kind"] in {"series", "movie"}:
+        return [
+            rollback
+            for rollback in rollbacks
+            if path_is_within(rollback["source_path"], scope["owner_path"])
+        ]
+    targets = {path.resolve() for path in scope["file_paths"]}
+    return [
+        rollback
+        for rollback in rollbacks
+        if rollback["source_path"].resolve() in targets
+    ]
+
+
+def season_cleanup_dirs(scope: dict) -> set[Path]:
+    owner_path = scope["owner_path"]
+    targets = {path.resolve() for path in scope["file_paths"]}
+    other_paths = {
+        path.resolve() for path in scope["all_file_paths"] if path.resolve() not in targets
+    }
+    directories: set[Path] = set()
+    for target in targets:
+        try:
+            relative = target.relative_to(owner_path.resolve())
+        except ValueError:
+            continue
+        if len(relative.parts) < 2:
+            continue
+        candidate = owner_path.resolve() / relative.parts[0]
+        if not any(path_is_within(other, candidate) for other in other_paths):
+            directories.add(candidate)
+    return directories
+
+
+def scope_is_still_unmonitored(api: ArrApi, scope: dict) -> bool:
+    item = api.managed_item(scope["resource"], scope["owner_id"])
+    if not item:
+        return False
+    if scope["kind"] in {"series", "movie"}:
+        return not item.get("monitored", False)
+    if not item.get("monitored", False):
+        return False
+    return any(
+        int(season.get("seasonNumber", -1)) == scope["season_number"]
+        and not season.get("monitored", False)
+        for season in item.get("seasons", [])
+    )
+
+
+def scope_retention_holds(
+    scope: dict,
+    state: dict,
+    downloads: Path,
+    torrents_by_hash: dict[str, dict],
+    by_name: dict[str, list[dict]],
+    by_top_level: dict[str, list[dict]],
+    now: int,
+    mutate: bool,
+) -> tuple[list[str], set[str]]:
+    hashes = set(scope["torrent_hashes"])
+    matched_paths: set[str] = set()
+    for top_level in scope["download_top_levels"]:
+        matches = matched_torrents(top_level, by_name, by_top_level)
+        if matches:
+            matched_paths.add(top_level)
+            hashes.update(
+                str(torrent["hash"]).lower() for torrent in matches if torrent.get("hash")
+            )
+
+    holds: list[str] = []
+    for torrent_hash in sorted(hashes):
+        torrent = torrents_by_hash.get(torrent_hash)
+        if not torrent:
+            continue
+        reason = retention_hold_reason(torrent)
+        if reason:
+            holds.append(f"{torrent.get('name', torrent_hash)[:45]}: {reason}")
+
+    for top_level in sorted(scope["download_top_levels"] - matched_paths):
+        if not (downloads / top_level).exists():
+            continue
+        reason = unmatched_hold_reason(state, top_level, now, mutate=mutate)
+        if reason:
+            holds.append(f"{top_level[:45]}: {reason}")
+    return holds, hashes
+
+
+def remove_scope_files(scope: dict) -> None:
+    if scope["kind"] in {"series", "movie"}:
+        shutil.rmtree(scope["owner_path"], ignore_errors=False)
+        return
+
+    cleanup_dirs = season_cleanup_dirs(scope)
+    for directory in cleanup_dirs:
+        if directory.exists():
+            shutil.rmtree(directory)
+    for media_path in scope["file_paths"]:
+        if any(path_is_within(media_path, directory) for directory in cleanup_dirs):
+            continue
+        with contextlib.suppress(FileNotFoundError):
+            media_path.unlink()
+        parent = media_path.parent
+        if not parent.is_dir():
+            continue
+        prefix = media_path.stem + "."
+        for sidecar in parent.iterdir():
+            if sidecar.is_file() and sidecar.name.startswith(prefix):
+                sidecar.unlink()
+    prune_empty_dirs(scope["owner_path"])
+
+
+def evict_unmonitored_media(
+    cfg: dict,
+    qb: QBittorrent,
+    torrents: list[dict],
+    state: dict,
+    downloads: Path,
+    dry_run: bool,
+) -> tuple[list[str], bool, bool]:
+    """Evict unmonitored Arr media only after every associated retention hold clears."""
+    if not cfg.get("unmonitored_eviction_enabled"):
+        return [], False, False
+
+    actions: list[str] = []
+    changed = False
+    failed = False
+    lock_context = (
+        contextlib.nullcontext()
+        if dry_run
+        else media_mutation_lock(
+            Path(cfg["media_mutation_lock_path"]),
+            int(cfg["media_mutation_lock_stale_seconds"]),
+        )
+    )
+    try:
+        with lock_context:
+            now = int(time.time())
+            record_torrent_state(state, torrents, downloads, now)
+            by_name, by_top_level = torrent_maps(torrents, downloads)
+            torrents_by_hash = {
+                str(torrent.get("hash", "")).lower(): torrent
+                for torrent in torrents
+                if torrent.get("hash")
+            }
+            inode_downloads = index_download_inodes(downloads)
+            rollbacks = load_normalizer_rollbacks(
+                Path(cfg["normalizer_state_path"]),
+                Path(cfg["normalizer_host_pool_path"]),
+                Path(
+                    os.path.commonpath(
+                        [downloads, Path(cfg["media_tv"]), Path(cfg["media_movies"])]
+                    )
+                ),
+            )
+
+            apps = (
+                (
+                    "Sonarr",
+                    cfg["sonarr_url"],
+                    cfg["sonarr_api_key"],
+                    Path(cfg["media_tv"]),
+                    sonarr_eviction_scopes,
+                    "episodefile",
+                    "episodeFileIds",
+                    (
+                        "page=1&pageSize=1000&includeUnknownSeriesItems=true"
+                        "&includeSeries=false&includeEpisode=false"
+                    ),
+                ),
+                (
+                    "Radarr",
+                    cfg["radarr_url"],
+                    cfg["radarr_api_key"],
+                    Path(cfg["media_movies"]),
+                    radarr_eviction_scopes,
+                    "moviefile",
+                    "movieFileIds",
+                    "page=1&pageSize=1000&includeUnknownMovieItems=true&includeMovie=false",
+                ),
+            )
+            for label, base_url, api_key, media_root, discover, file_resource, id_field, query in apps:
+                if not base_url or not api_key:
+                    actions.append(f"ERROR eviction: {label} API is not configured")
+                    failed = True
+                    continue
+                try:
+                    api = ArrApi(base_url, api_key)
+                    scopes = discover(api)
+                    history = api.history()
+                    queue = api.queue(query)
+                except Exception as exc:
+                    actions.append(f"ERROR eviction: {label} discovery failed: {exc}")
+                    failed = True
+                    continue
+
+                for scope in scopes:
+                    scope_label = f"{label} {scope['title']} {scope['label']}"
+                    if not is_strict_child(scope["owner_path"], media_root):
+                        actions.append(
+                            f"REFUSE eviction {scope_label}: unsafe path {scope['owner_path']}"
+                        )
+                        failed = True
+                        continue
+                    associate_scope_downloads(
+                        scope,
+                        history,
+                        queue,
+                        inode_downloads,
+                        downloads,
+                        set(torrents_by_hash),
+                    )
+                    matching_rollbacks = scope_rollbacks(scope, rollbacks)
+                    has_owner_content = (
+                        scope["kind"] in {"series", "movie"}
+                        and scope["owner_path"].exists()
+                        and any(scope["owner_path"].iterdir())
+                    )
+                    if not (
+                        scope["file_ids"]
+                        or scope["torrent_hashes"]
+                        or any(
+                            (downloads / top_level).exists()
+                            for top_level in scope["download_top_levels"]
+                        )
+                        or matching_rollbacks
+                        or has_owner_content
+                    ):
+                        continue
+
+                    holds, torrent_hashes = scope_retention_holds(
+                        scope,
+                        state,
+                        downloads,
+                        torrents_by_hash,
+                        by_name,
+                        by_top_level,
+                        now,
+                        mutate=not dry_run,
+                    )
+                    if holds:
+                        actions.append(f"EVICT-WAIT {scope_label}: {'; '.join(holds)}")
+                        continue
+                    try:
+                        if not scope_is_still_unmonitored(api, scope):
+                            actions.append(f"EVICT-CANCEL {scope_label}: monitoring changed")
+                            continue
+                        mode = "WOULD EVICT" if dry_run else "EVICT"
+                        actions.append(
+                            f"{mode:<11} {scope_label} "
+                            f"({len(scope['file_ids'])} media file(s), "
+                            f"{len(torrent_hashes)} torrent(s))"
+                        )
+                        if dry_run:
+                            continue
+                        qb.stop_torrents(sorted(torrent_hashes))
+                        api.delete_files(file_resource, id_field, sorted(scope["file_ids"]))
+                        if scope["owner_path"].exists():
+                            remove_scope_files(scope)
+                        for rollback in matching_rollbacks:
+                            with contextlib.suppress(FileNotFoundError):
+                                rollback["path"].unlink()
+                        changed = True
+                    except Exception as exc:
+                        actions.append(f"ERROR eviction {scope_label}: {exc}")
+                        failed = True
+    except MediaMutationLockBusy:
+        actions.append("EVICT-WAIT media normalizer is mutating the library")
+    except Exception as exc:
+        actions.append(f"ERROR eviction initialization failed: {exc}")
+        failed = True
+    return actions, changed, failed
+
+
 def prune_empty_dirs(path: Path) -> None:
     if not path.exists():
         return
@@ -1140,18 +1783,26 @@ def run(dry_run: bool, include_seeding: bool) -> int:
         )
         return 1
 
-    inodes = media_inodes(media_roots)
     state = load_retention_state(state_path)
     qb = QBittorrent(cfg["qb_url"], cfg["qb_user"], cfg["qb_pass"])
     torrents = qb.torrents()
+    eviction_actions, eviction_changed, eviction_failed = evict_unmonitored_media(
+        cfg, qb, torrents, state, downloads, dry_run
+    )
+    if eviction_changed:
+        torrents = qb.torrents()
+
     now = int(time.time())
     live_paths = record_torrent_state(state, torrents, downloads, now)
     torrent_by_name, torrent_by_top_level = torrent_maps(torrents, downloads)
+    # Arr eviction removes library links. Snapshot media only after that phase so
+    # the ordinary orphan cleanup can reclaim the download payload in this pass.
+    inodes = media_inodes(media_roots)
 
     remove_torrent_only: list[str] = []
     bytes_reclaimed = 0
     decluttered = 0
-    actions: list[str] = []
+    actions: list[str] = list(eviction_actions)
 
     for folder in sorted(downloads.iterdir()):
         if folder.name.startswith("."):
@@ -1317,7 +1968,7 @@ def run(dry_run: bool, include_seeding: bool) -> int:
     print(f"\nEstimated space reclaimed: {fmt_size(bytes_reclaimed)}")
     print(f"Hardlinked folders decluttered: {decluttered}")
     print(f"Actions: {len(actions)}")
-    return 0
+    return 1 if eviction_failed else 0
 
 
 def main() -> int:

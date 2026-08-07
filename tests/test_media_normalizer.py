@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from fractions import Fraction
 from pathlib import Path
@@ -85,6 +86,7 @@ def settings(root):
         env_path=root / ".env",
         state_path=root / "runtime/state.json",
         lock_path=root / "runtime/lock",
+        media_mutation_lock_path=root / "runtime/media-mutation.lock",
         rollback_root=root / "rollback",
         ffmpeg="ffmpeg",
         ffprobe="ffprobe",
@@ -176,6 +178,26 @@ class DetectionPolicyTests(unittest.TestCase):
 
 
 class StateAndLoggingTests(unittest.TestCase):
+    def test_shared_media_mutation_lock_is_atomic_and_removed_on_exit(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "locks/media.lock"
+            with media_normalizer.media_mutation_lock(path):
+                self.assertTrue(path.is_dir())
+                with self.assertRaises(media_normalizer.MediaMutationLockBusy):
+                    with media_normalizer.media_mutation_lock(path):
+                        pass
+            self.assertFalse(path.exists())
+
+    def test_stale_shared_media_mutation_lock_is_recovered(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "locks/media.lock"
+            path.mkdir(parents=True)
+            old = time.time() - 10
+            os.utime(path, (old, old))
+            with media_normalizer.media_mutation_lock(path, stale_seconds=1):
+                self.assertTrue(path.is_dir())
+            self.assertFalse(path.exists())
+
     def test_atomic_state_recovers_from_backup(self):
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / "state.json"
