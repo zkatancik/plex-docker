@@ -12,8 +12,6 @@
   </array>
   <key>WorkingDirectory</key>
   <string>/Users/zack/plex-docker</string>
-  <key>RunAtLoad</key>
-  <true/>
   <key>StartCalendarInterval</key>
   <array>
     <dict>
