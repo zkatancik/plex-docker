@@ -16,9 +16,16 @@
 !scripts/
 scripts/*
 !scripts/download-cleanup.py
+!scripts/media-normalizer.py
 !tests/
 !tests/**
 tests/__pycache__/
+
+# Track the LaunchAgent template, but never runtime state, diagnostics, or logs.
+!launchd/
+launchd/*
+!launchd/com.zkatancik.plex-media-normalizer.plist
+media-normalizer/
 
 # Track the non-secret Recyclarr policy while leaving its runtime cache,
 # logs, state, and any local secrets ignored.

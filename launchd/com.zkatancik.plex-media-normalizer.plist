@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.zkatancik.plex-media-normalizer</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/zack/plex-docker/scripts/media-normalizer.py</string>
+    <string>poll</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/zack/plex-docker</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>300</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LowPriorityIO</key>
+  <true/>
+  <key>Nice</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/zack/plex-docker/media-normalizer/launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/zack/plex-docker/media-normalizer/launchd-error.log</string>
+  <key>ThrottleInterval</key>
+  <integer>60</integer>
+</dict>
+</plist>
