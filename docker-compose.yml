@@ -52,7 +52,7 @@ services:
       - vpn_net
     devices:
       - /dev/net/tun:/dev/net/tun
-    restart: unless-stopped
+    restart: always
     
 
   # ─── qBittorrent through VPN ─────────────────────────────────────────
@@ -76,7 +76,7 @@ services:
       timeout: 15s
       retries: 3
       start_period: 45s
-    restart: unless-stopped
+    restart: always
 
   flaresolverr:
     image: ghcr.io/flaresolverr/flaresolverr:latest
@@ -91,7 +91,7 @@ services:
       timeout: 15s
       retries: 3
       start_period: 30s
-    restart: unless-stopped
+    restart: always
 
   qb-port-sync:
     image: zkatancik/gluetun-qbittorrent-port-manager:latest
@@ -115,7 +115,7 @@ services:
       timeout: 10s
       retries: 3
       start_period: 45s
-    restart: unless-stopped
+    restart: always
 
   # ─── Sonarr (TV shows) ────────────────────────────────────────────────
   sonarr:
@@ -139,7 +139,7 @@ services:
       timeout: 15s
       retries: 3
       start_period: 1m
-    restart: unless-stopped
+    restart: always
 
   # ─── Radarr (Movies) ──────────────────────────────────────────────────
   radarr:
@@ -163,7 +163,7 @@ services:
       timeout: 15s
       retries: 3
       start_period: 1m
-    restart: unless-stopped
+    restart: always
 
   # ─── Bazarr (Subtitles) ───────────────────────────────────────────────
   bazarr:
@@ -186,7 +186,7 @@ services:
       timeout: 15s
       retries: 3
       start_period: 1m
-    restart: unless-stopped
+    restart: always
 
   # ─── Unpackerr (Handles compressed downloads) ─────────────────────
   unpackerr:
@@ -213,7 +213,7 @@ services:
       timeout: 10s
       retries: 3
       start_period: 30s
-    restart: unless-stopped
+    restart: always
 
   # ─── Download cleanup (orphaned / superseded completed downloads) ───
   download-cleanup:
@@ -259,7 +259,7 @@ services:
       timeout: 90s
       retries: 2
       start_period: 30s
-    restart: unless-stopped
+    restart: always
 
   # ─── Recyclarr (Autofetch Sonarr and Radarr profiles) ---------------
   recyclarr:
@@ -285,7 +285,7 @@ services:
       timeout: 1m
       retries: 2
       start_period: 5m
-    restart: unless-stopped
+    restart: always
 
   # ─── Prowlarr (Indexer manager) ─────────────────────────────────────
   # Split routing: indexer HTTPS uses your normal network (default), not the VPN.
@@ -312,7 +312,7 @@ services:
       timeout: 15s
       retries: 3
       start_period: 1m
-    restart: unless-stopped
+    restart: always
 
   # ─── Seerr (Requests UI) ────────────────────────────────────────────
   overseerr:
@@ -337,7 +337,7 @@ services:
       timeout: 15s
       retries: 3
       start_period: 1m
-    restart: unless-stopped
+    restart: always
 
   # ─── Tautulli (Plex monitoring) ─────────────────────────────────────
   tautulli:
@@ -357,7 +357,7 @@ services:
       timeout: 15s
       retries: 3
       start_period: 1m
-    restart: unless-stopped
+    restart: always
 
   # ─── Agregarr (Plex collections manager) ─────────────────────────────
   agregarr:
@@ -381,7 +381,7 @@ services:
       timeout: 15s
       retries: 3
       start_period: 1m
-    restart: unless-stopped
+    restart: always
 
   # ─── Trailer Post-Processor (watches for new trailers and converts to Apple TV format) ───
   trailer-processor:
@@ -402,4 +402,4 @@ services:
       timeout: 10s
       retries: 3
       start_period: 30s
-    restart: unless-stopped
+    restart: always
