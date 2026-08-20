@@ -62,6 +62,8 @@ services:
     network_mode: "service:gluetun"
     depends_on:
       - gluetun
+    labels:
+      - com.centurylinklabs.watchtower.depends-on=gluetun
     environment:
       - PUID=${PUID}
       - PGID=${PGID}
@@ -82,6 +84,8 @@ services:
     image: ghcr.io/flaresolverr/flaresolverr:latest
     container_name: flaresolverr
     network_mode: "service:gluetun"                  # stays inside the VPN
+    labels:
+      - com.centurylinklabs.watchtower.depends-on=gluetun
     environment:
       - LOG_LEVEL=info
       - TZ=${TZ}
@@ -100,6 +104,8 @@ services:
     depends_on:
       - gluetun
       - qbittorrent
+    labels:
+      - com.centurylinklabs.watchtower.depends-on=gluetun,qbittorrent
     environment:
       - PORT_FORWARDED=/tmp/gluetun/forwarded_port   # read the file Gluetun writes
       - QBITTORRENT_SERVER=${QBITTORRENT_SERVER}     # Qbit is localhost in-ns
@@ -115,6 +121,31 @@ services:
       timeout: 10s
       retries: 3
       start_period: 45s
+    restart: always
+
+  # Recreates network-sharing services if Gluetun is replaced or a healthcheck fails.
+  # The Docker socket is required so this service can run the narrow Compose recovery.
+  vpn-network-reconciler:
+    image: docker:29-cli
+    container_name: vpn-network-reconciler
+    environment:
+      - INTERVAL_SECONDS=60
+      - REPAIR_COOLDOWN_SECONDS=300
+      - COMPOSE_PROJECT_NAME=plex-docker
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /Users/zack/plex-docker/docker-compose.yml:/stack/docker-compose.yml:ro
+      - /Users/zack/plex-docker/.env:/stack/.env:ro
+      - /Users/zack/plex-docker/containers/vpn-network-reconciler/reconcile.sh:/usr/local/bin/reconcile.sh:ro
+    command: ["/bin/sh", "/usr/local/bin/reconcile.sh"]
+    labels:
+      - com.centurylinklabs.watchtower.enable=false
+    healthcheck:
+      test: ["CMD-SHELL", "test -n \"$$(find /tmp/vpn-network-reconciler.heartbeat -mmin -3 -print -quit 2>/dev/null)\""]
+      interval: 1m
+      timeout: 10s
+      retries: 2
+      start_period: 30s
     restart: always
 
   # ─── Sonarr (TV shows) ────────────────────────────────────────────────
