@@ -17,6 +17,8 @@
 scripts/*
 !scripts/download-cleanup.py
 !scripts/media-normalizer.py
+!scripts/plex-docker-recover.sh
+!scripts/docker-stack-guardian.sh
 !tests/
 !tests/**
 tests/__pycache__/
@@ -25,6 +27,11 @@ tests/__pycache__/
 !launchd/
 launchd/*
 !launchd/com.zkatancik.plex-media-normalizer.plist
+!launchd/com.zack.plex-docker-recover.plist
+!launchd/com.zack.docker-stack-guardian.plist
+!docs/
+docs/*
+!docs/docker-stack-guardian.md
 media-normalizer/
 
 # Track the non-secret Recyclarr policy while leaving its runtime cache,
