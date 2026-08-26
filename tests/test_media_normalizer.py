@@ -292,6 +292,310 @@ class StateAndLoggingTests(unittest.TestCase):
             self.assertEqual("blocked", record["status"])
             self.assertTrue(record["automatic"])
 
+    def test_quality_gate_exhaustion_is_recorded_as_quality_rejected(self):
+        with tempfile.TemporaryDirectory() as root:
+            config = settings(root)
+            state = media_normalizer.empty_state()
+            state["watermarks"] = {
+                "sonarr": "2020-01-01T00:00:00Z",
+                "radarr": "2020-01-01T00:00:00Z",
+            }
+            media_normalizer.atomic_write_json(config.state_path, state)
+            item = media_normalizer.ManagedMedia(
+                service="sonarr",
+                owner_id=71,
+                file_id=1,
+                path=Path(root) / "episode.mkv",
+                date_added="2026-01-01T00:00:00Z",
+                season_number=4,
+            )
+            sonarr = mock.Mock()
+            sonarr.managed_media.return_value = [item]
+            radarr = mock.Mock()
+            radarr.managed_media.return_value = []
+            with (
+                mock.patch.object(
+                    media_normalizer,
+                    "arr_clients",
+                    return_value={"sonarr": sonarr, "radarr": radarr},
+                ),
+                mock.patch.object(
+                    media_normalizer,
+                    "normalize_one",
+                    side_effect=media_normalizer.QualityGateError(
+                        "quality gate failed: mean SSIM 0.99170, mean PSNR 38.52 dB"
+                    ),
+                ),
+            ):
+                self.assertEqual(1, media_normalizer.run_poll(config, dry_run=False))
+            record = media_normalizer.load_state(config.state_path)["files"][str(item.path)]
+            self.assertEqual("quality_rejected", record["status"])
+
+    def test_quality_rejected_record_is_not_selected_for_retry_or_backfill(self):
+        item = media_normalizer.ManagedMedia(
+            service="sonarr",
+            owner_id=71,
+            file_id=1,
+            path=Path("/tv/rejected.mkv"),
+            date_added="2026-08-01T00:00:00Z",
+        )
+        state = media_normalizer.empty_state()
+        state["files"][str(item.path)] = {
+            "automatic": True,
+            "status": "quality_rejected",
+        }
+        priority, unseen = media_normalizer.select_poll_work(
+            [item],
+            state,
+            {"sonarr": "2026-08-07T16:09:08Z"},
+            media_normalizer.parse_datetime("2026-08-08T12:00:00Z"),
+        )
+        self.assertEqual([], priority)
+        self.assertEqual([], unseen)
+
+    def test_all_managed_ignores_normalizer_temp_files(self):
+        real = media_normalizer.ManagedMedia(
+            service="sonarr",
+            owner_id=71,
+            file_id=1,
+            path=Path("/tv/Episode.mkv"),
+            date_added="2026-08-01T00:00:00Z",
+        )
+        temp = media_normalizer.ManagedMedia(
+            service="sonarr",
+            owner_id=71,
+            file_id=2,
+            path=Path("/tv/.Episode.mkv.media-normalizer.12345.tmp.mkv"),
+            date_added="2026-08-02T00:00:00Z",
+        )
+        client = mock.Mock()
+        client.managed_media.return_value = [real, temp]
+        managed = media_normalizer.all_managed({"sonarr": client})
+        self.assertEqual([real.path], [item.path for item in managed])
+
+    def test_pre_watermark_unseen_file_is_backfilled(self):
+        with tempfile.TemporaryDirectory() as root:
+            config = settings(root)
+            state = media_normalizer.empty_state()
+            state["watermarks"] = {
+                "sonarr": "2026-08-07T16:09:08Z",
+                "radarr": "2026-08-07T16:09:08Z",
+            }
+            media_normalizer.atomic_write_json(config.state_path, state)
+            item = media_normalizer.ManagedMedia(
+                service="sonarr",
+                owner_id=71,
+                file_id=1,
+                path=Path(root) / "episode.mkv",
+                date_added="2026-08-04T22:54:00Z",
+                season_number=4,
+            )
+            sonarr = mock.Mock()
+            sonarr.managed_media.return_value = [item]
+            radarr = mock.Mock()
+            radarr.managed_media.return_value = []
+
+            def fake_normalize(path, settings, state, **kwargs):
+                state["files"][str(path)] = {"status": "normalized"}
+                return {"status": "normalized"}
+
+            with (
+                mock.patch.object(
+                    media_normalizer,
+                    "arr_clients",
+                    return_value={"sonarr": sonarr, "radarr": radarr},
+                ),
+                mock.patch.object(
+                    media_normalizer, "normalize_one", side_effect=fake_normalize
+                ) as normalize,
+            ):
+                self.assertEqual(0, media_normalizer.run_poll(config, dry_run=False))
+            normalize.assert_called_once()
+            record = media_normalizer.load_state(config.state_path)["files"][str(item.path)]
+            self.assertEqual("normalized", record["status"])
+            self.assertTrue(record["automatic"])
+
+    def test_backfill_encode_limit_leaves_remaining_unseen(self):
+        with tempfile.TemporaryDirectory() as root:
+            config = settings(root)
+            config.backfill_encode_limit = 1
+            state = media_normalizer.empty_state()
+            state["watermarks"] = {
+                "sonarr": "2026-08-07T16:09:08Z",
+                "radarr": "2026-08-07T16:09:08Z",
+            }
+            media_normalizer.atomic_write_json(config.state_path, state)
+            first = media_normalizer.ManagedMedia(
+                service="sonarr",
+                owner_id=71,
+                file_id=1,
+                path=Path(root) / "a.mkv",
+                date_added="2026-08-04T22:54:00Z",
+            )
+            second = media_normalizer.ManagedMedia(
+                service="sonarr",
+                owner_id=71,
+                file_id=2,
+                path=Path(root) / "b.mkv",
+                date_added="2026-08-04T22:54:01Z",
+            )
+            sonarr = mock.Mock()
+            sonarr.managed_media.return_value = [first, second]
+            radarr = mock.Mock()
+            radarr.managed_media.return_value = []
+
+            def fake_normalize(path, settings, state, **kwargs):
+                state["files"][str(path)] = {"status": "normalized"}
+                return {"status": "normalized"}
+
+            with (
+                mock.patch.object(
+                    media_normalizer,
+                    "arr_clients",
+                    return_value={"sonarr": sonarr, "radarr": radarr},
+                ),
+                mock.patch.object(
+                    media_normalizer, "normalize_one", side_effect=fake_normalize
+                ) as normalize,
+            ):
+                self.assertEqual(0, media_normalizer.run_poll(config, dry_run=False))
+            self.assertEqual([second.path], [call.args[0] for call in normalize.call_args_list])
+            saved = media_normalizer.load_state(config.state_path)["files"]
+            self.assertIn(str(second.path), saved)
+            self.assertNotIn(str(first.path), saved)
+
+    def test_replaced_file_is_reinspected_even_when_older_than_watermark(self):
+        with tempfile.TemporaryDirectory() as root:
+            config = settings(root)
+            path = Path(root) / "episode.mkv"
+            path.write_bytes(b"current-bytes")
+            state = media_normalizer.empty_state()
+            state["watermarks"] = {
+                "sonarr": "2026-08-07T16:09:08Z",
+                "radarr": "2026-08-07T16:09:08Z",
+            }
+            state["files"][str(path)] = {
+                "automatic": True,
+                "file_identity": "0:0:1",
+                "status": "normalized",
+            }
+            media_normalizer.atomic_write_json(config.state_path, state)
+            item = media_normalizer.ManagedMedia(
+                service="sonarr",
+                owner_id=71,
+                file_id=1,
+                path=path,
+                date_added="2026-08-04T22:54:00Z",
+            )
+            sonarr = mock.Mock()
+            sonarr.managed_media.return_value = [item]
+            radarr = mock.Mock()
+            radarr.managed_media.return_value = []
+
+            def fake_normalize(path, settings, state, **kwargs):
+                state["files"][str(path)] = {"status": "compatible"}
+                return {"status": "compatible"}
+
+            with (
+                mock.patch.object(
+                    media_normalizer,
+                    "arr_clients",
+                    return_value={"sonarr": sonarr, "radarr": radarr},
+                ),
+                mock.patch.object(
+                    media_normalizer, "normalize_one", side_effect=fake_normalize
+                ) as normalize,
+            ):
+                self.assertEqual(0, media_normalizer.run_poll(config, dry_run=False))
+            normalize.assert_called_once()
+
+    def test_select_poll_work_keeps_new_imports_out_of_backfill(self):
+        older = media_normalizer.ManagedMedia(
+            service="sonarr",
+            owner_id=71,
+            file_id=1,
+            path=Path("/tv/old.mkv"),
+            date_added="2026-08-04T00:00:00Z",
+        )
+        newer = media_normalizer.ManagedMedia(
+            service="sonarr",
+            owner_id=71,
+            file_id=2,
+            path=Path("/tv/new.mkv"),
+            date_added="2026-08-08T00:00:00Z",
+        )
+        state = media_normalizer.empty_state()
+        priority, unseen = media_normalizer.select_poll_work(
+            [older, newer],
+            state,
+            {"sonarr": "2026-08-07T16:09:08Z"},
+            media_normalizer.parse_datetime("2026-08-08T12:00:00Z"),
+        )
+        self.assertEqual([newer], priority)
+        self.assertEqual([older], unseen)
+
+        older_newer_first, _unseen = media_normalizer.select_poll_work(
+            [
+                older,
+                media_normalizer.ManagedMedia(
+                    service="sonarr",
+                    owner_id=71,
+                    file_id=3,
+                    path=Path("/tv/older.mkv"),
+                    date_added="2020-01-01T00:00:00Z",
+                ),
+            ],
+            state,
+            {"sonarr": "2026-08-07T16:09:08Z"},
+            media_normalizer.parse_datetime("2026-08-08T12:00:00Z"),
+        )
+        self.assertEqual([], older_newer_first)
+        self.assertEqual(
+            [older.path, Path("/tv/older.mkv")],
+            [item.path for item in _unseen],
+        )
+
+    def test_season_continues_after_a_safety_error(self):
+        with tempfile.TemporaryDirectory() as root:
+            config = settings(root)
+            first = media_normalizer.ManagedMedia(
+                service="sonarr",
+                owner_id=71,
+                file_id=1,
+                path=Path(root) / "e05.mkv",
+                date_added="2026-08-04T22:54:00Z",
+                season_number=4,
+            )
+            second = media_normalizer.ManagedMedia(
+                service="sonarr",
+                owner_id=71,
+                file_id=2,
+                path=Path(root) / "e06.mkv",
+                date_added="2026-08-04T22:54:01Z",
+                season_number=4,
+            )
+            sonarr = mock.Mock()
+            sonarr.sonarr_season.return_value = [first, second]
+            with (
+                mock.patch.object(
+                    media_normalizer,
+                    "arr_clients",
+                    return_value={"sonarr": sonarr, "radarr": mock.Mock()},
+                ),
+                mock.patch.object(
+                    media_normalizer,
+                    "normalize_one",
+                    side_effect=[
+                        media_normalizer.SafetyError("file is open according to lsof"),
+                        {"status": "normalized"},
+                    ],
+                ) as normalize,
+            ):
+                self.assertEqual(1, media_normalizer.run_normalize_season(config, 71, 4, dry_run=False))
+            self.assertEqual(2, normalize.call_count)
+            record = media_normalizer.load_state(config.state_path)["files"][str(first.path)]
+            self.assertTrue(record["automatic"])
+
 
 class ArrTests(unittest.TestCase):
     def test_sonarr_media_polling_translates_container_paths(self):
@@ -369,6 +673,71 @@ class ReplacementSafetyTests(unittest.TestCase):
         result = subprocess.CompletedProcess([], 0, stdout="p123\n", stderr="")
         with mock.patch.object(media_normalizer, "run_process", return_value=result):
             self.assertTrue(media_normalizer.lsof_active(Path("episode.mkv")))
+
+    def test_hardlinked_open_file_is_treated_as_seeding_not_blocked(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            library = root / "Episode.mkv"
+            download = root / "Download.mkv"
+            library.write_bytes(b"payload")
+            os.link(library, download)
+            config = settings(root)
+            with (
+                mock.patch.object(media_normalizer, "lsof_active", return_value=True),
+                mock.patch.object(media_normalizer, "tautulli_active", return_value=False),
+            ):
+                media_normalizer.require_inactive(library, config)
+
+    def test_unique_open_file_is_blocked_by_lsof(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "Episode.mkv"
+            path.write_bytes(b"payload")
+            config = settings(root)
+            with (
+                mock.patch.object(media_normalizer, "lsof_active", return_value=True),
+                mock.patch.object(media_normalizer, "tautulli_active", return_value=False),
+            ):
+                with self.assertRaises(media_normalizer.SafetyError):
+                    media_normalizer.require_inactive(path, config)
+
+    def test_playback_is_blocked_even_when_the_file_is_hardlinked(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            library = root / "Episode.mkv"
+            download = root / "Download.mkv"
+            library.write_bytes(b"payload")
+            os.link(library, download)
+            config = settings(root)
+            with mock.patch.object(media_normalizer, "tautulli_active", return_value=True):
+                with self.assertRaises(media_normalizer.SafetyError) as raised:
+                    media_normalizer.require_inactive(library, config)
+            self.assertIn("Tautulli", str(raised.exception))
+
+    def test_encode_command_preserves_non_default_subtitle_disposition(self):
+        subtitle = {
+            "index": 1,
+            "codec_type": "subtitle",
+            "codec_name": "subrip",
+            "disposition": {
+                "default": 0,
+                "original": 1,
+                "hearing_impaired": 1,
+                "dub": 0,
+            },
+            "tags": {"language": "eng", "title": "English (SDH)"},
+        }
+        probe = media_probe(video_stream(complete=False), extras=[subtitle])
+        command = media_normalizer.encode_command(
+            Path("in.mkv"),
+            Path("out.mkv"),
+            probe,
+            {"signatures": ["incomplete_hvcc"], "frame_rate": "24000/1001"},
+            8_000_000,
+            "ffmpeg",
+        )
+        index = command.index("-disposition:s:0")
+        self.assertEqual("original+hearing_impaired", command[index + 1])
+        self.assertEqual("passthrough", command[command.index("-default_mode") + 1])
 
     def test_unexpected_temporary_path_cannot_replace_library(self):
         with tempfile.TemporaryDirectory() as root:
@@ -452,10 +821,11 @@ class StreamValidationTests(unittest.TestCase):
 
     def test_quality_gate_requires_both_thresholds(self):
         media_normalizer.validate_quality({"mean_ssim": 0.98, "mean_psnr": 40.0})
+        media_normalizer.validate_quality({"mean_ssim": 0.98, "mean_psnr": 37.0})
         with self.assertRaises(media_normalizer.ValidationError):
             media_normalizer.validate_quality({"mean_ssim": 0.979, "mean_psnr": 50.0})
         with self.assertRaises(media_normalizer.ValidationError):
-            media_normalizer.validate_quality({"mean_ssim": 0.99, "mean_psnr": 39.9})
+            media_normalizer.validate_quality({"mean_ssim": 0.99, "mean_psnr": 36.9})
 
 
 if __name__ == "__main__":

@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Audit and normalize media that is incompatible with the Plex Apple TV client.
 
-The worker is intentionally host-native: it uses the Mac's VideoToolbox encoder,
-keeps runtime state outside Git, and only modifies future Arr imports unless an
-operator explicitly selects an existing path or Sonarr season.
+The worker is intentionally host-native: it uses the Mac's VideoToolbox encoder
+and keeps runtime state outside Git. Scheduled polls always handle new Arr
+imports, then gradually inspect older library files that were never recorded so
+pre-existing Apple TV incompatibilities are not stranded behind the first-run
+watermark.
 """
 
 from __future__ import annotations
@@ -41,7 +43,29 @@ CUSTOM_HFR_REGEX = r"\b(?:48|50|59[ .]?94|60|120)[ ._-]?fps\b"
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".m4v", ".avi", ".ts"}
 HDR_TRANSFERS = {"smpte2084", "arib-std-b67"}
 HDR_PRIMARIES = {"bt2020"}
-RETRYABLE_STATUSES = {"blocked", "error", "interrupted"}
+RETRYABLE_STATUSES = {"blocked", "error", "interrupted", "encoding"}
+# quality_rejected is deliberately not retryable: the source failed the quality
+# gate at the bitrate ceiling, so re-encoding again can never succeed.
+ENCODED_POLL_STATUSES = {"normalized", "would_normalize"}
+TEMP_MARKER = ".media-normalizer."
+DISPOSITION_FLAGS = (
+    "default",
+    "dub",
+    "original",
+    "comment",
+    "lyrics",
+    "karaoke",
+    "forced",
+    "hearing_impaired",
+    "visual_impaired",
+    "clean_effects",
+    "attached_pic",
+    "timed_thumbnails",
+    "captions",
+    "descriptions",
+    "dependent",
+    "still_image",
+)
 NORMALIZABLE_SIGNATURES = {"av1", "hfr", "incomplete_hvcc"}
 MEDIA_MUTATION_LOCK_STALE_SECONDS = int(
     os.environ.get("MEDIA_MUTATION_LOCK_STALE_SECONDS", "300")
@@ -74,6 +98,10 @@ class ValidationError(NormalizerError):
     """An encoded output failed a compatibility or quality gate."""
 
 
+class QualityGateError(ValidationError):
+    """The quality gate failed at the bitrate ceiling; retrying cannot help."""
+
+
 class LockBusy(NormalizerError):
     """Another normalizer process owns the lock."""
 
@@ -103,6 +131,8 @@ class Settings:
     settle_seconds: float = 2.0
     rollback_days: int = 30
     quality_window_seconds: int = 10
+    backfill_inspect_limit: int = 200
+    backfill_encode_limit: int = 20
 
 
 @dataclass
@@ -232,6 +262,12 @@ def load_settings(repo_root: Optional[Path] = None) -> Settings:
         rollback_days=int(os.environ.get("MEDIA_NORMALIZER_ROLLBACK_DAYS", "30")),
         quality_window_seconds=int(
             os.environ.get("MEDIA_NORMALIZER_QUALITY_WINDOW", "10")
+        ),
+        backfill_inspect_limit=max(
+            0, int(os.environ.get("MEDIA_NORMALIZER_BACKFILL_INSPECT", "200"))
+        ),
+        backfill_encode_limit=max(
+            0, int(os.environ.get("MEDIA_NORMALIZER_BACKFILL_ENCODE", "20"))
         ),
     )
 
@@ -949,6 +985,28 @@ def stream_inventory(probe: Dict[str, Any]) -> Dict[str, Any]:
     return inventory
 
 
+def disposition_arg(stream: Dict[str, Any]) -> str:
+    disposition = stream.get("disposition") or {}
+    names = [name for name in DISPOSITION_FLAGS if disposition.get(name)]
+    return "+".join(names) if names else "0"
+
+
+def append_disposition_args(command: List[str], probe: Dict[str, Any]) -> None:
+    counts = {"video": 0, "audio": 0, "subtitle": 0}
+    specifiers = {"video": "v", "audio": "a", "subtitle": "s"}
+    for stream in probe.get("streams", []):
+        kind = stream.get("codec_type")
+        if kind not in counts:
+            continue
+        command.extend(
+            [
+                "-disposition:%s:%d" % (specifiers[kind], counts[kind]),
+                disposition_arg(stream),
+            ]
+        )
+        counts[kind] += 1
+
+
 def is_relative_to(path: Path, parent: Path) -> bool:
     try:
         path.resolve().relative_to(parent.resolve())
@@ -1015,10 +1073,21 @@ def tautulli_active(path: Path, settings: Settings) -> bool:
 
 
 def require_inactive(path: Path, settings: Settings) -> None:
-    if lsof_active(path):
-        raise SafetyError("file is open according to lsof")
     if tautulli_active(path, settings):
         raise SafetyError("file is in an active Plex/Tautulli session")
+    if not lsof_active(path):
+        return
+    try:
+        nlink = path.stat().st_nlink
+    except OSError:
+        nlink = 1
+    if nlink >= 2:
+        # The media path is a Sonarr hardlink of the torrent payload. qBittorrent
+        # keeps that inode open while seeding; replacing only the media directory
+        # entry leaves the original bytes in Downloads for the rest of the seed
+        # window.
+        return
+    raise SafetyError("file is open according to lsof")
 
 
 def estimated_output_bytes(probe: Dict[str, Any], bitrate: int) -> int:
@@ -1069,7 +1138,7 @@ def create_rollback(source: Path, destination: Path) -> Dict[str, Any]:
 
 
 def temporary_output(path: Path) -> Path:
-    return path.parent / (".%s.media-normalizer.%d.tmp.mkv" % (path.name, os.getpid()))
+    return path.parent / (".%s%s%d.tmp.mkv" % (path.name, TEMP_MARKER, os.getpid()))
 
 
 def encode_command(
@@ -1122,6 +1191,7 @@ def encode_command(
         "-fps_mode:v:0",
         "cfr",
     ]
+    append_disposition_args(command, probe)
     color_options = {
         "color_primaries": "-color_primaries:v:0",
         "color_transfer": "-color_trc:v:0",
@@ -1132,7 +1202,17 @@ def encode_command(
         value = video.get(field)
         if value and value != "unknown":
             command.extend([option, str(value)])
-    command.extend(["-max_muxing_queue_size", "4096", "-f", "matroska", str(output)])
+    command.extend(
+        [
+            "-max_muxing_queue_size",
+            "4096",
+            "-f",
+            "matroska",
+            "-default_mode",
+            "passthrough",
+            str(output),
+        ]
+    )
     return command
 
 
@@ -1277,7 +1357,10 @@ def quality_metrics(
 
 
 def validate_quality(metrics: Dict[str, Any]) -> None:
-    if metrics["mean_ssim"] < 0.98 or metrics["mean_psnr"] < 40.0:
+    # PSNR floor is 37 rather than 40: grainy sources (e.g. Tires) encode with
+    # visually transparent SSIM >= 0.98 but cannot reach 40 dB even at the
+    # bitrate ceiling, and rejecting them leaves the incompatible original.
+    if metrics["mean_ssim"] < 0.98 or metrics["mean_psnr"] < 37.0:
         raise ValidationError(
             "quality gate failed: mean SSIM %.5f, mean PSNR %.2f dB"
             % (metrics["mean_ssim"], metrics["mean_psnr"])
@@ -1330,7 +1413,7 @@ def plex_refresh(path: Path, settings: Settings) -> Dict[str, Any]:
 def replace_atomically(output: Path, destination: Path) -> None:
     if output.parent != destination.parent:
         raise SafetyError("temporary output is not in the destination directory")
-    if not output.name.startswith("." + destination.name + ".media-normalizer."):
+    if not output.name.startswith("." + destination.name + TEMP_MARKER):
         raise SafetyError("refusing to replace from an unexpected temporary path")
     os.replace(output, destination)
 
@@ -1421,10 +1504,10 @@ def normalize_one(
             try:
                 validate_quality(metrics)
                 break
-            except ValidationError:
+            except ValidationError as exc:
                 next_bitrate = retry_bitrate(bitrate, ceiling)
                 if next_bitrate is None:
-                    raise
+                    raise QualityGateError(str(exc)) from exc
                 bitrate = next_bitrate
                 log("quality gate requested retry at %.3f Mb/s" % (bitrate / 1_000_000), settings)
 
@@ -1471,11 +1554,18 @@ def normalize_one(
             output=result["output"],
             arr_scan=arr_scan,
             plex_scan=plex_scan,
+            file_identity="%d:%d:%d"
+            % (replacement_stat.st_dev, replacement_stat.st_ino, replacement_stat.st_size),
         )
         atomic_write_json(settings.state_path, state)
         return result
     except BaseException as exc:
-        status = "interrupted" if isinstance(exc, (KeyboardInterrupt, SystemExit)) else "error"
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            status = "interrupted"
+        elif isinstance(exc, QualityGateError):
+            status = "quality_rejected"
+        else:
+            status = "error"
         state["files"][str(path)] = record_for(
             report,
             status,
@@ -1521,6 +1611,10 @@ def all_managed(clients: Dict[str, ArrClient]) -> List[ManagedMedia]:
         found.extend(client.managed_media())
     unique: Dict[str, ManagedMedia] = {}
     for item in found:
+        if TEMP_MARKER in item.path.name:
+            # Sonarr/Radarr can register our in-flight temp outputs as episode
+            # files if a library scan races an encode; never treat them as work.
+            continue
         if item.path.suffix.lower() in VIDEO_EXTENSIONS:
             unique[str(item.path)] = item
     return sorted(unique.values(), key=lambda item: str(item.path))
@@ -1569,6 +1663,110 @@ def run_audit(settings: Settings, *, json_output: bool) -> int:
     return 0
 
 
+def current_file_identity(path: Path) -> Optional[str]:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return "%d:%d:%d" % (stat.st_dev, stat.st_ino, stat.st_size)
+
+
+def mark_automatic(state: Dict[str, Any], item: ManagedMedia) -> None:
+    record = state["files"].setdefault(str(item.path), {})
+    record["automatic"] = True
+    record["service"] = item.service
+    record["date_added"] = item.date_added
+
+
+def select_poll_work(
+    items: Sequence[ManagedMedia],
+    state: Dict[str, Any],
+    watermarks: Dict[str, str],
+    cycle: dt.datetime,
+) -> Tuple[List[ManagedMedia], List[ManagedMedia]]:
+    """Split Arr media into watermark/retry/replaced work versus unseen backfill."""
+    priority: Dict[str, ManagedMedia] = {}
+    unseen: List[ManagedMedia] = []
+    for item in items:
+        key = str(item.path)
+        added = parse_datetime(item.date_added)
+        watermark = parse_datetime(watermarks.get(item.service, ""))
+        record = state["files"].get(key)
+        imported = watermark < added <= cycle
+        if record:
+            retry = record.get("status") in RETRYABLE_STATUSES and record.get(
+                "automatic", True
+            )
+            recorded_identity = record.get("file_identity")
+            current_identity = current_file_identity(item.path)
+            replaced = bool(
+                recorded_identity
+                and current_identity
+                and current_identity != recorded_identity
+            )
+            if imported or retry or replaced:
+                priority[key] = item
+            continue
+        if imported:
+            priority[key] = item
+        else:
+            unseen.append(item)
+    return (
+        sorted(priority.values(), key=lambda item: (item.date_added, str(item.path))),
+        sorted(
+            unseen,
+            key=lambda item: (-parse_datetime(item.date_added).timestamp(), str(item.path)),
+        ),
+    )
+
+
+def process_poll_item(
+    item: ManagedMedia,
+    settings: Settings,
+    state: Dict[str, Any],
+    clients: Dict[str, ArrClient],
+    *,
+    dry_run: bool,
+    source: str,
+) -> Tuple[str, bool]:
+    try:
+        result = normalize_one(
+            item.path,
+            settings,
+            state,
+            dry_run=dry_run,
+            managed=item,
+            clients=clients,
+        )
+        if not dry_run:
+            mark_automatic(state, item)
+            atomic_write_json(settings.state_path, state)
+        log("%s result: %s %s" % (source, result["status"], item.path), settings)
+        return result["status"], False
+    except (NormalizerError, OSError) as exc:
+        if isinstance(exc, QualityGateError):
+            status = "quality_rejected"
+        elif isinstance(exc, SafetyError):
+            status = "blocked"
+        else:
+            status = "error"
+        record = state["files"].setdefault(str(item.path), {})
+        record.update(
+            {
+                "updated_at": isoformat(utc_now()),
+                "status": status,
+                "error": str(exc),
+                "automatic": True,
+                "service": item.service,
+                "date_added": item.date_added,
+            }
+        )
+        if not dry_run:
+            atomic_write_json(settings.state_path, state)
+        log("%s failed for %s: %s" % (source, item.path, exc), settings, stderr=True)
+        return record["status"], True
+
+
 def run_poll(settings: Settings, *, dry_run: bool) -> int:
     state = load_state(settings.state_path)
     clients = arr_clients(settings)
@@ -1580,60 +1778,67 @@ def run_poll(settings: Settings, *, dry_run: bool) -> int:
             state["watermarks"] = {service: isoformat(cycle) for service in clients}
             state["initialized_at"] = isoformat(cycle)
             atomic_write_json(settings.state_path, state)
-            log("established first-run watermark; existing media remains report-only", settings)
+            log(
+                "established first-run watermark; later polls backfill older incompatible media",
+                settings,
+            )
         return 0
 
-    candidates: Dict[str, ManagedMedia] = {}
-    for service, client in clients.items():
-        watermark = parse_datetime(state["watermarks"].get(service, ""))
-        for item in client.managed_media():
-            added = parse_datetime(item.date_added)
-            record = state["files"].get(str(item.path), {})
-            retry = record.get("automatic") and record.get("status") in RETRYABLE_STATUSES
-            if (watermark < added <= cycle) or retry:
-                candidates[str(item.path)] = item
-
+    priority, unseen = select_poll_work(
+        all_managed(clients),
+        state,
+        state["watermarks"],
+        cycle,
+    )
+    backfill: List[ManagedMedia] = []
+    inspected = 0
+    backfill_encoded = 0
     failures = 0
-    for item in sorted(candidates.values(), key=lambda value: (value.date_added, str(value.path))):
-        try:
-            result = normalize_one(
-                item.path,
-                settings,
-                state,
-                dry_run=dry_run,
-                managed=item,
-                clients=clients,
-            )
-            if not dry_run:
-                state["files"][str(item.path)]["automatic"] = True
-                state["files"][str(item.path)]["service"] = item.service
-                state["files"][str(item.path)]["date_added"] = item.date_added
-                atomic_write_json(settings.state_path, state)
-            log("poll result: %s %s" % (result["status"], item.path), settings)
-        except (NormalizerError, OSError) as exc:
-            failures += 1
-            record = state["files"].setdefault(str(item.path), {})
-            record.update(
-                {
-                    "updated_at": isoformat(utc_now()),
-                    "status": "blocked" if isinstance(exc, SafetyError) else "error",
-                    "error": str(exc),
-                    "automatic": True,
-                    "service": item.service,
-                    "date_added": item.date_added,
-                }
-            )
-            if not dry_run:
-                atomic_write_json(settings.state_path, state)
-            log("poll failed for %s: %s" % (item.path, exc), settings, stderr=True)
+    for item in priority:
+        _status, failed = process_poll_item(
+            item,
+            settings,
+            state,
+            clients,
+            dry_run=dry_run,
+            source="poll",
+        )
+        failures += int(failed)
+
+    for item in unseen:
+        if inspected >= settings.backfill_inspect_limit:
+            break
+        if backfill_encoded >= settings.backfill_encode_limit:
+            break
+        inspected += 1
+        backfill.append(item)
+        status, failed = process_poll_item(
+            item,
+            settings,
+            state,
+            clients,
+            dry_run=dry_run,
+            source="backfill",
+        )
+        failures += int(failed)
+        if status in ENCODED_POLL_STATUSES:
+            backfill_encoded += 1
 
     if not dry_run:
         state["watermarks"] = {service: isoformat(cycle) for service in clients}
         removed = cleanup_rollbacks(state, settings)
         atomic_write_json(settings.state_path, state)
         if removed:
-            log("retired %d rollback links older than %d days" % (len(removed), settings.rollback_days), settings)
-    log("poll complete: %d candidate(s), %d failure(s)" % (len(candidates), failures), settings)
+            log(
+                "retired %d rollback links older than %d days"
+                % (len(removed), settings.rollback_days),
+                settings,
+            )
+    log(
+        "poll complete: %d import(s), %d backfill(s), %d failure(s)"
+        % (len(priority), len(backfill), failures),
+        settings,
+    )
     return 1 if failures else 0
 
 
@@ -1676,11 +1881,14 @@ def run_normalize_season(
                 managed=item,
                 clients=clients,
             )
+            if not dry_run:
+                mark_automatic(state, item)
             log("season result: %s %s" % (result["status"], item.path), settings)
         except (NormalizerError, OSError) as exc:
             failures += 1
+            if not dry_run:
+                mark_automatic(state, item)
             log("season failed for %s: %s" % (item.path, exc), settings, stderr=True)
-            break
     if not dry_run:
         atomic_write_json(settings.state_path, state)
     log("season complete: %d file(s), %d failure(s)" % (len(files), failures), settings)
@@ -1734,7 +1942,10 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     audit = subparsers.add_parser("audit", help="inspect all Arr-managed media")
     audit.add_argument("--json", action="store_true", help="emit a machine-readable report")
-    poll = subparsers.add_parser("poll", help="process imports newer than the watermark")
+    poll = subparsers.add_parser(
+        "poll",
+        help="process new Arr imports, then backfill older unrecorded incompatible media",
+    )
     poll.add_argument("--dry-run", action="store_true", help="report without changing state or media")
     normalize = subparsers.add_parser("normalize", help="explicitly normalize existing media")
     selection = normalize.add_mutually_exclusive_group(required=True)
