@@ -3,6 +3,9 @@
 # Recyclarr intentionally owns only the custom formats declared here. Existing
 # quality membership, cutoffs, scores for other formats, and file-size limits
 # remain unchanged.
+# Radarr's existing profiles use Original audio; Bazarr supplies full English
+# subtitles for non-English audio. Keep language policy in the application:
+# this custom-format-only sync must not reset it to English-only.
 sonarr:
   television:
     base_url: !env_var SONARR_URL http://sonarr:8989

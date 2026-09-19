@@ -44,7 +44,7 @@ services:
       - 127.0.0.11
     ports:
       - "8080:8080/tcp"    # qBittorrent Web UI
-      - "8191:8191"        # flaresolverr (Prowlarr on bridge reaches this via host.docker.internal:8191)
+      - "8191:8191"        # FlareSolverr host access; Prowlarr uses gluetun:8191 on vpn_net.
     volumes:
       - /Users/zack/plex-docker/gluetun:/gluetun
       - /Users/zack/plex-docker/gluetun:/tmp/gluetun 
@@ -123,7 +123,7 @@ services:
       start_period: 45s
     restart: always
 
-  # Recreates network-sharing services if Gluetun is replaced or a healthcheck fails.
+  # Reconnects VPN dependents after Gluetun restarts/replacements or health failures.
   # The Docker socket is required so this service can run the narrow Compose recovery.
   vpn-network-reconciler:
     image: docker:29-cli
@@ -141,7 +141,7 @@ services:
     labels:
       - com.centurylinklabs.watchtower.enable=false
     healthcheck:
-      test: ["CMD-SHELL", "test -n \"$$(find /tmp/vpn-network-reconciler.heartbeat -mmin -3 -print -quit 2>/dev/null)\""]
+      test: ["CMD-SHELL", "test -n \"$$(find /tmp/vpn-network-reconciler.success -mmin -3 -print -quit 2>/dev/null)\""]
       interval: 1m
       timeout: 10s
       retries: 2

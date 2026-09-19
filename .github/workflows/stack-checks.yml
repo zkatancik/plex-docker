@@ -1,0 +1,33 @@
+name: Check stack automation
+
+on:
+  push:
+    paths:
+      - .github/workflows/stack-checks.yml
+      - containers/vpn-network-reconciler/**
+      - scripts/**
+      - tests/**
+      - docker-compose.yml
+  pull_request:
+    paths:
+      - .github/workflows/stack-checks.yml
+      - containers/vpn-network-reconciler/**
+      - scripts/**
+      - tests/**
+      - docker-compose.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Check recovery script syntax
+        run: sh -n containers/vpn-network-reconciler/reconcile.sh
+      - name: Run automation regression tests
+        run: python3 -m unittest discover -s tests -v

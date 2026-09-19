@@ -32,6 +32,7 @@ launchd/*
 !docs/
 docs/*
 !docs/docker-stack-guardian.md
+!docs/plex-stack-repair.md
 media-normalizer/
 
 # Track the non-secret Recyclarr policy while leaving its runtime cache,
