@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -748,6 +749,52 @@ class ReplacementSafetyTests(unittest.TestCase):
             with self.assertRaises(media_normalizer.SafetyError):
                 media_normalizer.replace_atomically(output, destination)
 
+    def test_mp4_encode_keeps_container_and_cover_art(self):
+        cover = {
+            "index": 2,
+            "codec_type": "video",
+            "codec_name": "mjpeg",
+            "disposition": {"attached_pic": 1},
+        }
+        source = Path("special.mp4")
+        output = media_normalizer.temporary_output(source)
+        command = media_normalizer.encode_command(
+            source,
+            output,
+            media_probe(video_stream(codec="h264", rate="50/1"), extras=[cover]),
+            {"signatures": ["hfr"], "frame_rate": "50/1"},
+            8_000_000,
+            "ffmpeg",
+        )
+        self.assertEqual(".mp4", output.suffix)
+        self.assertEqual("mp4", command[command.index("-f") + 1])
+        self.assertEqual("hvc1", command[command.index("-tag:v:0") + 1])
+        self.assertEqual("+faststart", command[command.index("-movflags") + 1])
+        self.assertEqual("attached_pic", command[command.index("-disposition:v:1") + 1])
+        self.assertNotIn("-default_mode", command)
+
+    def test_mp4_reaches_encoder_and_preserves_source_on_interruption(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "special.mp4"
+            path.write_bytes(b"original")
+            config = settings(root)
+            state = media_normalizer.empty_state()
+            report = {"decision": "normalize", "signatures": ["hfr"], "frame_rate": "50/1"}
+            with (
+                mock.patch.object(media_normalizer, "inspect_path", return_value=report),
+                mock.patch.object(media_normalizer, "probe_media", return_value=media_probe()),
+                mock.patch.object(media_normalizer, "require_stable"),
+                mock.patch.object(media_normalizer, "require_inactive"),
+                mock.patch.object(media_normalizer, "require_free_space"),
+                mock.patch.object(media_normalizer, "run_process", side_effect=KeyboardInterrupt),
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    media_normalizer.normalize_one(path, config, state, dry_run=False)
+            self.assertEqual(b"original", path.read_bytes())
+            record = state["files"][str(path.resolve())]
+            self.assertEqual("interrupted", record["status"])
+            self.assertEqual(b"original", Path(record["rollback"]["path"]).read_bytes())
+
     def test_idempotent_compatible_file_does_not_encode(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)
@@ -796,6 +843,70 @@ class ReplacementSafetyTests(unittest.TestCase):
 
 
 class StreamValidationTests(unittest.TestCase):
+    def test_quality_windows_align_hfr_reference_and_output_frames(self):
+        self.assertEqual(
+            [0.0, 2.0, 4.04],
+            media_normalizer.quality_windows(5.04, 1, Fraction(25)),
+        )
+
+    def test_quality_windows_preserve_ntsc_alignment_at_millisecond_precision(self):
+        self.assertEqual(
+            [0.0, 2.002, 4.004],
+            media_normalizer.quality_windows(5.04, 1, Fraction(30000, 1001)),
+        )
+
+    def test_cover_art_must_survive_normalization(self):
+        cover = {
+            "codec_type": "video",
+            "codec_name": "mjpeg",
+            "disposition": {"attached_pic": 1},
+        }
+        source = media_probe(extras=[cover])
+        output = media_probe()
+        with self.assertRaises(media_normalizer.ValidationError):
+            media_normalizer.compare_streams(
+                source, output, {"signatures": [], "frame_rate": "24000/1001"}
+            )
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg is required for the timing regression")
+    def test_lossless_hfr_conversions_compare_identical_frames(self):
+        for rate, target in (("50/1", "25/1"), ("60000/1001", "30000/1001")):
+            with self.subTest(rate=rate), tempfile.TemporaryDirectory() as root:
+                config = settings(root)
+                config.ffmpeg = shutil.which("ffmpeg")
+                source, output = Path(root) / "source.mkv", Path(root) / "output.mkv"
+                fixture = (
+                    "nullsrc=s=64x64:r=%s:d=5.04,"
+                    "geq=lum=mod(X*17+Y*13+N*37\\,256):cb=128:cr=128" % rate
+                )
+                media_normalizer.run_process(
+                    [
+                        config.ffmpeg, "-v", "error", "-f", "lavfi", "-i", fixture,
+                        "-pix_fmt", "yuv420p", "-c:v", "ffv1", str(source),
+                    ]
+                )
+                media_normalizer.run_process(
+                    [
+                        config.ffmpeg, "-v", "error", "-i", str(source),
+                        "-vf", "fps=" + target, "-c:v", "ffv1", str(output),
+                    ]
+                )
+                probe = media_probe(
+                    video_stream(
+                        codec="ffv1", rate=rate, pix_fmt="yuv420p", bits_per_raw_sample="8"
+                    ),
+                    duration=5.04,
+                )
+                metrics = media_normalizer.quality_metrics(
+                    source,
+                    output,
+                    probe,
+                    {"signatures": ["hfr"], "frame_rate": rate},
+                    config,
+                )
+                for window in metrics["windows"]:
+                    self.assertAlmostEqual(1.0, window["ssim"], places=6)
+
     def test_audio_subtitles_chapters_and_dispositions_are_preserved(self):
         audio = {
             "codec_type": "audio",

@@ -965,10 +965,13 @@ def output_frame_rate(report: Dict[str, Any]) -> Fraction:
 
 def stream_inventory(probe: Dict[str, Any]) -> Dict[str, Any]:
     inventory: Dict[str, Any] = {"chapters": len(probe.get("chapters", []))}
-    for kind in ("audio", "subtitle", "attachment", "data"):
+    main_video = primary_video(probe)
+    for kind in ("audio", "subtitle", "attachment", "data", "video"):
         entries = []
         for stream in probe.get("streams", []):
             if stream.get("codec_type") != kind:
+                continue
+            if kind == "video" and stream is main_video:
                 continue
             entries.append(
                 {
@@ -1138,7 +1141,9 @@ def create_rollback(source: Path, destination: Path) -> Dict[str, Any]:
 
 
 def temporary_output(path: Path) -> Path:
-    return path.parent / (".%s%s%d.tmp.mkv" % (path.name, TEMP_MARKER, os.getpid()))
+    return path.parent / (
+        ".%s%s%d.tmp%s" % (path.name, TEMP_MARKER, os.getpid(), path.suffix.lower())
+    )
 
 
 def encode_command(
@@ -1202,17 +1207,12 @@ def encode_command(
         value = video.get(field)
         if value and value != "unknown":
             command.extend([option, str(value)])
-    command.extend(
-        [
-            "-max_muxing_queue_size",
-            "4096",
-            "-f",
-            "matroska",
-            "-default_mode",
-            "passthrough",
-            str(output),
-        ]
-    )
+    command.extend(["-max_muxing_queue_size", "4096"])
+    if source.suffix.lower() == ".mp4":
+        command.extend(["-f", "mp4", "-tag:v:0", "hvc1", "-movflags", "+faststart"])
+    else:
+        command.extend(["-f", "matroska", "-default_mode", "passthrough"])
+    command.append(str(output))
     return command
 
 
@@ -1273,7 +1273,9 @@ def compare_streams(
     if source_video.get("disposition", {}) != output_video.get("disposition", {}):
         raise ValidationError("output video disposition changed")
     if stream_inventory(source_probe) != stream_inventory(output_probe):
-        raise ValidationError("audio, subtitle, attachment, data, or chapter metadata changed")
+        raise ValidationError(
+            "audio, subtitle, attachment, data, secondary video, or chapter metadata changed"
+        )
     duration_difference = abs(media_duration(source_probe) - media_duration(output_probe))
     if duration_difference > max(1.0, 2.0 / float(expected_rate)):
         raise ValidationError("output duration changed by %.3f seconds" % duration_difference)
@@ -1287,12 +1289,18 @@ def metric_value(text: str, kind: str) -> float:
     return 100.0 if matches[-1] == "inf" else float(matches[-1])
 
 
-def quality_windows(duration: float, window: int) -> List[float]:
+def quality_windows(duration: float, window: int, frame_rate: Fraction) -> List[float]:
     maximum = max(0.0, duration - window)
     values = [0.0, max(0.0, duration / 2.0 - window / 2.0), maximum]
+    # Independent input seeks must start on the same output-frame boundary.
+    # A half-frame seek changes the HFR downsampling phase and compares
+    # different pictures. Use boundaries exactly representable in milliseconds
+    # (also the Matroska timestamp precision), including NTSC frame rates.
+    step = Fraction(frame_rate.denominator, math.gcd(frame_rate.numerator, 1000))
     result: List[float] = []
     for value in values:
-        rounded = round(min(value, maximum), 3)
+        aligned = int(Fraction(str(min(value, maximum))) / step) * step
+        rounded = round(float(aligned), 3)
         if rounded not in result:
             result.append(rounded)
     return result
@@ -1307,14 +1315,24 @@ def quality_metrics(
 ) -> Dict[str, Any]:
     depth = bit_depth(primary_video(source_probe))
     pixel_format = "yuv420p10le" if depth > 8 else "yuv420p"
+    output_rate = output_frame_rate(report)
     reference_filters: List[str] = []
     if "hfr" in report.get("signatures", []):
-        reference_filters.append("fps=%s" % rate_string(output_frame_rate(report)))
-    reference_filters.extend(["setpts=PTS-STARTPTS", "format=%s" % pixel_format])
-    output_filters = ["setpts=PTS-STARTPTS", "format=%s" % pixel_format]
+        reference_filters.append("fps=%s" % rate_string(output_rate))
+    # Container timestamps can round an NTSC frame to milliseconds while the
+    # reference fps filter uses an exact rational clock. Rebase both samples
+    # onto the same frame clock so framesync does not reuse the previous frame.
+    output_filters = [
+        "settb=expr=%s" % rate_string(1 / output_rate),
+        "setpts=N",
+        "format=%s" % pixel_format,
+    ]
+    reference_filters.extend(output_filters)
     windows: List[Dict[str, Any]] = []
     duration = media_duration(source_probe)
-    for position in quality_windows(duration, settings.quality_window_seconds):
+    for position in quality_windows(
+        duration, settings.quality_window_seconds, output_rate
+    ):
         values: Dict[str, Any] = {"position": position}
         for metric in ("ssim", "psnr"):
             graph = "[0:v:0]%s[ref];[1:v:0]%s[dist];[ref][dist]%s" % (
@@ -1452,8 +1470,8 @@ def normalize_one(
         result["status"] = "would_normalize"
         return result
     try:
-        if path.suffix.lower() != ".mkv":
-            raise SafetyError("automatic replacement currently requires an MKV destination")
+        if path.suffix.lower() not in {".mkv", ".mp4"}:
+            raise SafetyError("automatic replacement requires an MKV or MP4 destination")
         source_probe = probe_media(path, settings.ffprobe)
         bitrate, ceiling = select_bitrate(source_probe)
         require_stable(path, settings)
