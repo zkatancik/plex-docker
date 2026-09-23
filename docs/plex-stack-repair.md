@@ -38,6 +38,41 @@ All four should return the same `net:[...]` value. A container reporting
 See [the reconciler operations guide](../containers/vpn-network-reconciler/README.md)
 for deployment, manual recovery, and regression tests.
 
+## Advertise the forwarded VPN address
+
+On 2026-09-23, Proton's NAT-PMP gateway reported a different public address
+from outbound HTTP traffic. qBittorrent listened on the correct forwarded
+port, but had no announce-address override. Testing the outbound address
+timed out; the NAT-PMP address accepted a BitTorrent handshake and served a
+16 KiB block from a retained torrent. Zero upload speed and the WebUI's
+`firewalled` indicator alone were not sufficient to diagnose this.
+
+`qb-port-sync` now runs `scripts/qb-port-sync.py` in Gluetun's namespace.
+Every 60 seconds it reads Gluetun's port file, sends a read-only NAT-PMP
+external-address query to `10.2.0.1`, and reconciles both `listen_port` and
+`announce_ip`. Gluetun remains responsible for allocating and renewing the
+lease. The worker validates the response and port, detects concurrent port
+changes, and reads back qBittorrent preferences before recording success.
+Its health check requires a verification within three minutes. An unchanged
+endpoint produces no settings write; failures never fall back to the host's
+public address or log credentials.
+
+Deploy only the affected worker:
+
+```sh
+docker compose up -d --no-deps qb-port-sync
+docker exec qb-port-sync python3 /app/qb-port-sync.py --health
+docker compose logs --tail 10 qb-port-sync
+python3 -m unittest discover -s tests -p test_qb_port_sync.py -v
+```
+
+For a rollback to the old port-only image, also restore the prior qBittorrent
+announce-address setting through its API. Do not leave a static VPN address
+configured after removing the worker that keeps it current.
+
+Protocol references: [Proton's manual NAT-PMP setup](https://protonvpn.com/support/port-forwarding-manual-setup)
+and [qBittorrent's announce-address setting](https://github.com/qbittorrent/qBittorrent/blob/master/src/base/bittorrent/sessionimpl.cpp).
+
 ## Prompt Plex scans after import
 
 Radarr and Sonarr previously had no Plex connection configured. Plex's

@@ -17,6 +17,7 @@
 scripts/*
 !scripts/download-cleanup.py
 !scripts/media-normalizer.py
+!scripts/qb-port-sync.py
 !scripts/plex-docker-recover.sh
 !scripts/docker-stack-guardian.sh
 !tests/

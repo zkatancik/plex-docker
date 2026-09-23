@@ -98,8 +98,9 @@ services:
     restart: always
 
   qb-port-sync:
-    image: zkatancik/gluetun-qbittorrent-port-manager:latest
+    image: python:3.12-alpine
     container_name: qb-port-sync
+    command: ["python3", "/app/qb-port-sync.py"]
     network_mode: "service:gluetun"                  # same net-ns as Qbit & Gluetun
     depends_on:
       - gluetun
@@ -111,12 +112,14 @@ services:
       - QBITTORRENT_SERVER=${QBITTORRENT_SERVER}     # Qbit is localhost in-ns
       - QBITTORRENT_PORT=${QBITTORRENT_PORT}         # your WEBUI_PORT                     # default control-server port
       - RECHECK_TIME=60                              # seconds between checks
+      - NAT_PMP_GATEWAY=10.2.0.1
       - QBITTORRENT_USERNAME=${QBITTORRENT_USER}
       - QBITTORRENT_PASSWORD=${QBITTORRENT_PASS}
     volumes:
       - /Users/zack/plex-docker/gluetun:/tmp/gluetun:ro
+      - /Users/zack/plex-docker/scripts/qb-port-sync.py:/app/qb-port-sync.py:ro
     healthcheck:
-      test: ["CMD-SHELL", "test -s /tmp/gluetun/forwarded_port && pgrep -f '/bin/bash ./start.sh' >/dev/null"]
+      test: ["CMD", "python3", "/app/qb-port-sync.py", "--health"]
       interval: 1m
       timeout: 10s
       retries: 3
