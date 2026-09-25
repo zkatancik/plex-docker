@@ -356,10 +356,13 @@ services:
 
   # ─── Seerr (Requests UI) ────────────────────────────────────────────
   overseerr:
-    image: overseerr:radarr-sonarr-priority
+    image: overseerr:arr-availability
     build:
-      # Seerr develop + Radarr/Sonarr availability priority compatibility fix.
-      context: https://github.com/samohtxotom/seerr.git#ddc87450da16d246f206cd102d0f92d6c59b2498
+      # Same pinned Seerr fork, with accurate partial-season availability.
+      context: .
+      dockerfile: containers/seerr/Dockerfile
+      additional_contexts:
+        upstream: https://github.com/samohtxotom/seerr.git#ddc87450da16d246f206cd102d0f92d6c59b2498
       args:
         COMMIT_TAG: "ddc87450"
     container_name: overseerr

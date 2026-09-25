@@ -191,3 +191,66 @@ Download only after Arr accepts it with no rejection reasons; restore the
 backup if that cannot be confirmed. Validate the imported file by full decode,
 Plex visibility, and its retained seeding payload. A missing acceptable source
 does not justify bypassing quality rules or discarding the original.
+
+## Sonarr logging database corruption
+
+Sonarr can return an empty health-warning list while `TrimLogDatabase` fails.
+Check recent housekeeping logs as well as the health API. On 2026-09-25,
+SQLite integrity checks reproduced corruption in `logs.db` (including the
+`IX_Logs_Time` index), while `sonarr.db` passed both online and stopped checks.
+The initial cause of the corruption was not established.
+
+With the download/import queue empty, stop only Sonarr, preserve its database
+files and sidecars in a private ignored backup directory, and move the damaged
+`logs.db*` files out of its configuration directory. Start Sonarr so it creates
+a fresh logging database. Do not replace the healthy main database. This is
+the [Sonarr maintainer's logging-database recovery procedure](https://forums.sonarr.tv/t/getting-a-nzbdroneerrorpipeline-in-the-logs-should-i-be-worried/7289),
+with the original files retained instead of deleted.
+
+Validate both databases, the log API, a completed `Housekeeping` command,
+unchanged series identities, download-client connectivity, and later worker
+cycles. The isolated logging repair preserved all 57 configured series.
+
+## Continuing seasons that were previously complete
+
+The pinned Seerr fork retained `AVAILABLE` for both a season and its parent
+show after the catalog added more episodes. For example, The Adam Ray Show
+had ten files but thirty catalog episodes, including eight missing aired
+episodes, and remained fully available after a Sonarr scan.
+
+`containers/seerr/patch-availability.cjs` removes that stale completion only
+when Arr is the configured authority and Sonarr reports a positive incomplete
+count for the same resolution. Empty scans, specials, the other resolution,
+and configurations without Arr priority keep their existing behavior. Plex
+and Jellyfin scans still cannot override Arr availability in priority mode.
+The patch changes display availability, not request approval, monitoring,
+quality profiles, or downloads.
+
+The build uses the same pinned upstream source and Node base as before,
+checks each patch location exactly once, and tests the actual compiled
+`processShow` method against nine scenarios. An upstream source change that
+invalidates the patch fails the build. Deploy only Seerr:
+
+```sh
+docker compose build overseerr
+docker compose up -d --no-deps overseerr
+```
+
+Run Seerr's Sonarr scan, verify the exact season and media status, then repeat
+the scan to check persistence. A successful Plex scan should also leave the
+partial status intact. The prior `overseerr:radarr-sonarr-priority` image can
+be retained for rollback; application data is unchanged by the image build.
+Live validation changed only request 14's media availability from complete
+to partial across all 48 requests; approval states were preserved. A Sonarr
+scan, Plex full scan, and second Sonarr scan all retained the corrected state.
+The repository regression suite now requires Node.js as well as Python.
+
+## Plex catalog identity checks
+
+Full files can be present while their Plex catalog match is missing or wrong.
+Compare the exact file path and Radarr TMDB/IMDb IDs against Plex's GUIDs.
+Query Plex's movie matcher by `tmdb-<id>` and apply only a verified exact
+match through its match API. Preserve the prior metadata privately and verify
+the rating key, file path, and watched count afterward. This corrected Busboys
+and Obsession on 2026-09-25 without moving or replacing their media.
+The API operation is documented in [PlexAPI's match implementation](https://python-plexapi.readthedocs.io/en/latest/_modules/plexapi/mixins/unmatch_match.html).

@@ -5,6 +5,7 @@ on:
     paths:
       - .github/workflows/stack-checks.yml
       - containers/vpn-network-reconciler/**
+      - containers/seerr/**
       - scripts/**
       - tests/**
       - docker-compose.yml
@@ -12,6 +13,7 @@ on:
     paths:
       - .github/workflows/stack-checks.yml
       - containers/vpn-network-reconciler/**
+      - containers/seerr/**
       - scripts/**
       - tests/**
       - docker-compose.yml
@@ -27,7 +29,13 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+      - name: Set up Node for Seerr regression tests
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
       - name: Check recovery script syntax
         run: sh -n containers/vpn-network-reconciler/reconcile.sh
+      - name: Check Seerr availability patch syntax
+        run: node --check containers/seerr/patch-availability.cjs
       - name: Run automation regression tests
         run: python3 -m unittest discover -s tests -v

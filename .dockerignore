@@ -6,3 +6,5 @@
 !containers/download-cleanup/
 !containers/download-cleanup/Dockerfile
 !containers/download-cleanup/entrypoint.sh
+!containers/seerr/
+!containers/seerr/**
