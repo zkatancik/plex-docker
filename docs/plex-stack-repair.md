@@ -166,6 +166,30 @@ misaligned NTSC comparisons. Both could reject a lossless conversion. The
 regression tests exercise real lossless 50/25 and 59.94/29.97 fps fixtures
 when FFmpeg is installed. The SSIM and PSNR thresholds are unchanged.
 
+## Shared media mutation lock
+
+The normalizer and download cleanup coordinate through the **directory**
+`/Volumes/HomeLabPool/.automation-locks/media-library-mutation.lock`. They
+acquire it with atomic `mkdir`, refresh its modification time while working,
+and remove it on release. The normalizer's separate `normalizer.lock` is a
+regular file protected by `flock`. Do not create or open the shared lock as a
+regular file, even for a read-only lock probe: this blocks both workers.
+
+On 2026-10-05, an empty regular file at the shared lock path caused both
+scheduled normalizer polls to exit with `EX_TEMPFAIL`, leaving the import
+watermarks unchanged. Its creator was not established. Download cleanup was
+also unable to acquire the shared lock despite its retention guard remaining
+healthy. Check worker logs and actual lock acquisition as well as container
+health.
+
+If the shared path has the wrong type, first confirm process ownership,
+open file handles, and host/container worker activity. Coordinate under the
+normalizer process lock and preserve the file outside the active lock path
+before testing the existing directory-lock context manager. Do not remove a
+live lock or infer safety from age alone. Run a normalizer poll and cleanup
+dry run, then verify their next scheduled cycles. The original empty file
+is retained as `.automation-locks/media-library-mutation.lock.pre-20261005`.
+
 ## Reconciling completed acquisitions
 
 Seerr's Radarr and Sonarr scans reconcile request availability from the
