@@ -64,3 +64,24 @@ open ~/Library/Logs/docker-stack-guardian
 
 The main log is `guardian.log`. LaunchAgent stdout and stderr are recorded in
 the same directory.
+
+## Discovering live services
+
+The guardian queries Docker's Compose project and service labels directly,
+including stopped containers. It uses explicit project names for each managed
+group. Working-directory labels are not reliable identities: VPN dependents
+created by the reconciler carry `/stack` while host-created containers carry
+the host checkout path.
+
+This avoids reading Compose environment files during healthy checks. An iCloud
+file-provider error reading Hockey's `.env` previously appeared as a missing
+container and triggered repeated failed recovery attempts even though the
+service was running. A failed Docker query or inspection now defers recovery;
+only a successful query with no matching container means missing. Actual
+recovery still requires readable Compose configuration and credentials.
+
+Run the discovery and deferral regression tests with:
+
+```sh
+python3 -m unittest discover -s tests -p test_docker_stack_guardian.py -v
+```

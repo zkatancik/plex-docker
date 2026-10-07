@@ -33,6 +33,10 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '22'
+      - name: Install zsh for macOS guardian regression tests
+        run: sudo apt-get update && sudo apt-get install -y zsh
+      - name: Check guardian script syntax
+        run: zsh -n scripts/docker-stack-guardian.sh
       - name: Check recovery script syntax
         run: sh -n containers/vpn-network-reconciler/reconcile.sh
       - name: Check Seerr availability patch syntax

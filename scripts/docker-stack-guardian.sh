@@ -37,32 +37,33 @@ stack_disabled() {
 }
 
 service_state() {
-  local project_dir="$1"
-  local compose_file="$2"
-  local env_file="$3"
-  local service="$4"
+  local project_name="$1"
+  local service="$2"
   local container_id
-  local -a env_args
 
-  env_args=()
-  if [[ -n "${env_file}" ]]; then
-    env_args=(--env-file "${env_file}")
+  # Runtime discovery must not depend on reading a cloud-hosted .env file.
+  # A failed Compose config read previously looked like a missing container.
+  if ! container_id="$(
+    "${DOCKER}" ps --all --quiet \
+      --filter "label=com.docker.compose.project=${project_name}" \
+      --filter "label=com.docker.compose.service=${service}" \
+      --filter "label=com.docker.compose.oneoff=False" 2>/dev/null
+  )"; then
+    echo "unknown"
+    return
   fi
-
-  container_id="$(
-    "${DOCKER}" compose \
-      --project-directory "${project_dir}" \
-      --file "${compose_file}" \
-      "${env_args[@]}" \
-      ps --quiet "${service}" 2>/dev/null
-  )"
 
   if [[ -z "${container_id}" ]]; then
     echo "missing"
     return
   fi
 
-  "${DOCKER}" inspect --format '{{.State.Status}}' "${container_id}" 2>/dev/null || echo "missing"
+  local observed_state
+  if observed_state="$("${DOCKER}" inspect --format '{{.State.Status}}' "${container_id}" 2>/dev/null)" && [[ -n "${observed_state}" ]]; then
+    echo "${observed_state}"
+  else
+    echo "unknown"
+  fi
 }
 
 recover_stack() {
@@ -70,7 +71,8 @@ recover_stack() {
   local project_dir="$2"
   local compose_file="$3"
   local env_file="$4"
-  shift 4
+  local project_name="$5"
+  shift 5
 
   local -a services
   local -a unavailable
@@ -100,7 +102,11 @@ recover_stack() {
   fi
 
   for service in "${services[@]}"; do
-    state="$(service_state "${project_dir}" "${compose_file}" "${env_file}" "${service}")"
+    state="$(service_state "${project_name}" "${service}")"
+    if [[ "${state}" == "unknown" ]]; then
+      log "${stack_name} state query failed for ${service}; deferring recovery"
+      return 1
+    fi
     if [[ "${state}" != "running" ]]; then
       unavailable+=("${service}:${state}")
     fi
@@ -114,6 +120,7 @@ recover_stack() {
   if (
     cd "${project_dir}" &&
     "${DOCKER}" compose \
+      --project-name "${project_name}" \
       --project-directory "${project_dir}" \
       --file "${compose_file}" \
       "${env_args[@]}" \
@@ -134,35 +141,35 @@ recover_stack \
   "/Users/zack/plex-docker" \
   "/Users/zack/plex-docker/docker-compose.yml" \
   "" \
-  gluetun qbittorrent flaresolverr qb-port-sync vpn-network-reconciler || (( failures += 1 ))
+  plex-docker gluetun qbittorrent flaresolverr qb-port-sync vpn-network-reconciler || (( failures += 1 ))
 
 recover_stack \
   "nextcloud" \
   "/Users/zack/nextcloud-docker" \
   "/Users/zack/nextcloud-docker/docker-compose.yml" \
   "" \
-  db redis app cron || (( failures += 1 ))
+  nextcloud-docker db redis app cron || (( failures += 1 ))
 
 recover_stack \
   "travelagent" \
   "/Users/zack/travel-prowler/deploy" \
   "/Users/zack/travel-prowler/deploy/compose.yaml" \
   "/Users/zack/travel-prowler/.env.deploy" \
-  postgres api worker jobs web edge dozzle cloudflared || (( failures += 1 ))
+  travelagent postgres api worker jobs web edge dozzle cloudflared || (( failures += 1 ))
 
 recover_stack \
   "watchtower" \
   "/Users/zack/watchtower-docker" \
   "/Users/zack/watchtower-docker/docker-compose.yml" \
   "" \
-  watchtower || (( failures += 1 ))
+  watchtower-docker watchtower || (( failures += 1 ))
 
 recover_stack \
   "hockey-standings" \
   "/Users/zack/Library/Mobile Documents/com~apple~CloudDocs/Hockey/code/hockey-standings-service" \
   "/Users/zack/Library/Mobile Documents/com~apple~CloudDocs/Hockey/code/hockey-standings-service/compose.yaml" \
   "" \
-  hockey-standings || (( failures += 1 ))
+  hockey-standings-service hockey-standings || (( failures += 1 ))
 
 if (( failures > 0 )); then
   log "Guardian completed with ${failures} failed stack recovery attempt(s)"
