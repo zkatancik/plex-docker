@@ -4,8 +4,8 @@ This service coordinates participating heavy jobs. It does not execute commands,
 
 ## Admission policy
 
-- Bounded queue, 32 pending requests. With capacity bypass disabled (the current live setting), FIFO ordering does not bypass older live large jobs with smaller newcomers. A queued owner must keep polling; 30 seconds without a poll expires only its never-granted request. Its explicit queue deadline still applies.
-- Submission, status reads and background ticks never grant work. Only the FIFO head's current owner poll may claim a grant. This prevents an abandoned queue entry becoming an active orphan when memory pressure later clears.
+- Bounded queue, 32 pending requests. As verified on 2026-11-05, this host enables oldest-fitting capacity fairness: a younger fitting request cannot claim before an older fitting request. A nonfitting head can be bypassed under the two-completion/120-second bound below. Queued owners must maintain liveness with owner polls or non-granting queued heartbeats; the default 30-second timeout expires only never-granted requests. The original queue deadline still applies.
+- Submission, status reads, queued heartbeats and background ticks never grant work. Only the selected eligible request's current owner poll may claim a grant. This prevents an abandoned queue entry becoming an active orphan when memory pressure later clears.
 - One active lease globally, including Docker and participating native clients.
 - The normal route requires macOS pressure level 1 and measured host swap reads **and** writes each at most 1 MiB/s for 60 continuously observed seconds. An unknown probe, counter reset, pressure increase, swap burst, or observation gap longer than 10 seconds restarts the healthy window.
 - Host probes are cached for 5 seconds. Swap rates use `vm_stat` counter deltas and the actual host page size; nonzero historical swap occupancy does not block grants.
@@ -26,16 +26,37 @@ valid observation anchors the window without crediting earlier time. Guest
 availability must still cover the truthful declared peak plus 512 MiB.
 Native work remains on the original normal-pressure route.
 
-The separate capacity-fairness implementation is disabled on this host
-(`capacity_bypass_enabled=false`); ordinary FIFO ordering remains in effect.
-Its reviewed activation is pending the separately owned maintenance window.
-When enabled, the oldest currently fitting owner receives priority; after two
-confirmed-stopped bypasses, a 120-second reservation gives the old head an
-opportunity to fit before eligible smaller work resumes. Budgets, health gates,
+On 2026-11-05 at 23:19:16 UTC, this host activated capacity fairness
+(`capacity_bypass_enabled=true`, `capacity_max_bypasses=2`,
+`capacity_reservation_s=120`) and the non-granting queued-heartbeat endpoint.
+The oldest currently fitting owner receives priority; after two confirmed
+completed/stopped bypasses, a 120-second hold on younger grants gives the old
+head an opportunity. It can claim immediately if it fits; otherwise fitting
+work resumes after the hold.
+Budgets, health gates,
 and one-slot ownership remain unchanged. This does not guarantee admission for
 a workload that never fits, or retain age across abandoned/new request UUIDs.
 See [WARNING_POLICY.md](WARNING_POLICY.md) for sources, exact behavior,
 qualification limits and the request-age limitation across client retries.
+
+## Dated deployment evidence
+
+The 2026-11-05 rollout qualified 87 overlapping coordinator/receipt/fairness/
+queued-heartbeat tests; this is not 87 independent live workloads. Installed
+coordinator SHA-256 is
+`ca47224ced504fad0e3019bc07dee9ad357287d9c2770d8289db4b0e7924ce19`.
+The private `capacity-rollout-20261105T231755Z/receipt.json` records verified
+activation under the owned fence and matches the installed configuration.
+The backend endpoint can preserve a queued UUID without granting it, but each
+application must integrate that lifecycle; deployed Fantasy `41e7940` still
+uses five-second attempts. Candidate `87673a1` was reviewed but not deployed in
+the 23:43:28 UTC status snapshot.
+
+Docker was restored to 10 GiB and all 38 services checked against the fresh
+pre-restoration baseline. The exact owned fence cleared at 23:43:28 UTC. These
+infrastructure checks and smaller real warning-route completions do not qualify
+the largest forecast/research peaks or a full workload week. The earlier 9 GiB
+trial did not fit the 4096+512 MiB requirement at its dated capacity sample.
 
 ## Configuration and first installation
 
@@ -54,7 +75,9 @@ Example config contains no credential. Put real config/state/token outside repos
   "max_swap_mib_s": 1,
   "max_peak_mib": 4096,
   "warning_enabled": true,
-  "capacity_bypass_enabled": false,
+  "capacity_bypass_enabled": true,
+  "capacity_max_bypasses": 2,
+  "capacity_reservation_s": 120,
   "guest_reserve_mib": 512,
   "max_queue": 32,
   "queued_owner_timeout_s": 30,
@@ -134,7 +157,7 @@ All endpoints require `Authorization: Bearer <token>`. All successful operations
 
 New submissions return `queued`, even when the host is healthy. Submitting the same ID and parameters is idempotent; it does not refresh queued-owner liveness. Reusing an ID for different work returns 409. IDs must be 8–80 letters/digits/hyphens/underscores; job names are at most 100 characters. Wait/run timeouts must be positive and at most 86,400 seconds. Only 128 terminal records are retained, so UUIDs must never intentionally be reused.
 
-`GET /v1/requests/{request_id}` is an **owner poll and claim**, normally every two seconds. For queued work it refreshes liveness and may grant that exact head request. Use `/v1/status` for observational monitoring, not this endpoint. States are `queued`, `granted`, `blocked_orphan`, `released`, `cancelled`, `expired`. Responses include `request_id`, `reason`, `heartbeat_interval_s` (5), `lease_timeout_s` (30), and the original parameters. A granted response adds opaque `lease_id` and numeric Unix-epoch-seconds `run_deadline`. `run_deadline` is omitted while queued. The runtime budget starts at grant, not at the client's later work start. Existing clients that POST then poll GET remain compatible.
+`GET /v1/requests/{request_id}` is an **owner poll and claim**, normally every two seconds. For queued work it refreshes liveness and may grant that exact request only if the current fairness/health/capacity policy selects it. Use `/v1/status` for observational monitoring, not this endpoint. States are `queued`, `granted`, `blocked_orphan`, `released`, `cancelled`, `expired`. Responses include `request_id`, `reason`, `heartbeat_interval_s` (5), `lease_timeout_s` (30), and the original parameters. A granted response adds opaque `lease_id` and numeric Unix-epoch-seconds `run_deadline`. `run_deadline` is omitted while queued. The runtime budget starts at grant, not at the client's later work start. Existing clients that POST then poll GET remain compatible.
 
 The queued-owner timeout defaults to 30 seconds (configurable from 5 to 300). On coordinator restart, previously queued requests get a fresh timeout grace to resume polling, but none can be granted without a current poll. Active/granted/orphan requests never expire through this queue mechanism. An already expired request cannot revive; submit a new UUID for a later attempt.
 
@@ -173,7 +196,7 @@ There is intentionally no automatic context-manager release: cancelling an async
 ## Supervised commands and recurring cron
 
 ```sh
-python3 client.py --url http://host.docker.internal:8766 --token-file /run/secrets/memory-coordinator-token run --job nextcloud-cron --peak-mib 1024 --run-timeout 1800 --wait-timeout 86400 -- php -f /var/www/html/cron.php
+python3 client.py --url http://host.docker.internal:8766 --token-file /run/secrets/memory-coordinator-token run --job nextcloud-cron --peak-mib 1536 --run-timeout 1800 --wait-timeout 86400 --receipt-file /var/ncdata/.memory-coordinator/nextcloud-cron.json -- php -f /var/www/html/cron.php
 ```
 
 The CLI creates an owned process group, starts heartbeats, and on timeout/heartbeat loss/cancellation sends TERM, then KILL if necessary, and waits for the entire group before releasing. A group that cannot be confirmed stopped retains its lease. Commands **must not daemonize or escape the owned process group**; use app-specific lifecycle integration for such workloads. SIGKILL of the wrapper cannot run cleanup, so the service retains an orphan instead of admitting overlapping work.
@@ -204,12 +227,19 @@ work stopped. Unknown/pruned records for that uncertain phase fail closed too.
 Crashes between physical completion and its durable acknowledgement therefore
 remain conservative, and no receipt can prove completion of escaped descendants.
 
-For the mounted Nextcloud data directory, a suitable future opt-in is
-`--receipt-file /var/ncdata/.memory-coordinator/nextcloud-cron.json`, with its parent
-created mode 0700 and owned by UID 33. This path is outside `/var/www/html` and
-persists container recreation. Adding the flag to the existing cron loop requires
-its separately coordinated restart; installing this client alone does not enable
-receipts or restart any service. Existing invocations continue without receipts.
+On this host, Nextcloud durable receipts are **enabled**, verified on
+2026-11-05 against the running `nc-cron` entrypoint and its read-only loop mount.
+`/Users/zack/nextcloud-docker/config/cron-memory-loop.py` is mounted at
+`/opt/memory-coordinator/cron-loop.py`. It passes
+`--receipt-file /var/ncdata/.memory-coordinator/nextcloud-cron.json`, declares
+1536 MiB, uses a 1800-second runtime budget and 86400-second queue budget, then
+waits 300 seconds after completion before the next invocation. The persistent
+receipt parent was verified UID/GID 33 and mode 0700; it is outside
+`/var/www/html` on the mounted data directory. Installed and source loop SHA-256:
+`59388239ba0f82351d138de9a41912c73c0d8d395eb83e8d2700b886840f4647`.
+The receipt's presence can mean queued or active cleanup ownership; it is not
+itself evidence that cron completed. The generic client still makes receipts
+opt-in for other invocations; installing client source alone enables no service.
 
 `cron_loop.py` accepts the same URL/token/job/peak/run/wait options plus `--interval 300` and the command after `--`. It runs one admitted job at a time and waits the interval **after completion**. Queue waits cannot accumulate multiple cron children. It intentionally replaces a separate scheduler for that one command; do not run both it and the original cron scheduler simultaneously.
 
@@ -226,7 +256,7 @@ Expired heartbeat/runtime or coordinator restart never automatically frees an ac
 python3 client.py --url http://127.0.0.1:8766 --token-file /absolute/private/directory/token resolve REQUEST_ID --confirm-workload-stopped
 ```
 
-This explicit acknowledgement is necessary because the host service cannot reliably prove that a job inside another process/container has stopped. A live original owner can also recover by heartbeat before its deadline. No bypass/force-grant exists. If the host remains pressured, reduce baseline pressure or complete the controlled Docker capacity change first; do not bootstrap by disabling the gate.
+This explicit acknowledgement is necessary because the host service cannot reliably prove that a job inside another process/container has stopped. A live original owner can also recover by heartbeat before its deadline. No pressure/capacity override or force-grant exists; the enabled queue-position bypass does not relax those gates. If the host remains pressured, reduce baseline pressure or complete the controlled Docker capacity change first; do not bootstrap by disabling the gate.
 
 A five-second maintenance tick observes health and advances the same locked state
 machine independently of requests. This lets clients use short queue attempts

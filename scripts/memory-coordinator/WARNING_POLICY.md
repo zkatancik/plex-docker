@@ -1,8 +1,10 @@
 # Bounded warning-pressure admission
 
 The implementation defaults both policy switches to false. This host enabled
-`warning_enabled=true` on 2026-11-05 after 70 tests and independent review;
-`capacity_bypass_enabled=false` remains explicit. Runtime configuration retains
+`warning_enabled=true` on 2026-11-05 after the initial 70-test review, then
+activated `capacity_bypass_enabled=true` with a two-completion/120-second bound
+and the non-granting queued-heartbeat endpoint at 23:19:16 UTC. The final
+coordinator suite passed 87 overlapping tests. Runtime configuration retains
 max peak 4096 MiB, guest reserve 512 MiB, and the original normal-pressure gate.
 The private rollout receipt preserves code/config/state provenance. Actual job
 completion is still required to qualify the added route for this workload mix.
@@ -29,7 +31,7 @@ not a reservation and says nothing about macOS physical headroom. The host
 pressure/swap requirements therefore remain separate.
 [Linux meminfo definition](https://www.kernel.org/doc/html/latest/filesystems/proc.html#meminfo)
 
-## Candidate behavior
+## Enabled warning behavior (November 5 trial)
 
 The existing normal route keeps its pressure-1, swap-rate and 60-second stable
 window thresholds. The warning route is opt-in and requires:
@@ -70,7 +72,7 @@ still cannot grant.
 
 When the queue head cannot fit the current route/capacity, at most two later
 jobs may complete ahead of it. After those confirmed completions, reserve
-120 seconds with no new grants for the old job to become eligible. If it fits,
+120 seconds without younger grants for the old job to become eligible. If it fits,
 its owner can claim immediately. If it still cannot fit after that bounded
 pause, fitting work resumes and a new bounded cycle begins; its age is retained.
 This is a count/quiet-opportunity bound, not a wall-time promise: active jobs
@@ -84,8 +86,12 @@ retain the existing behavior.
 
 Fairness applies to a surviving request, not a logical job that repeatedly
 cancels and submits a new UUID. Fantasy's current five-second retry pattern can
-lose age this way. Fixing that client lifecycle is outside this staged policy;
-do not describe this candidate as an absolute no-starvation guarantee for it.
+lose age this way in deployed build `41e7940` (23:43:28 UTC snapshot). The live
+non-granting queued-heartbeat endpoint lets integrated clients retain an
+unexpired logical request without claiming a lease; it does not upgrade old
+clients automatically or extend queue deadlines. Candidate `87673a1` passed
+scoped review but was not deployed at that snapshot. Do not describe fairness
+as an absolute no-starvation guarantee.
 The persistent `last_capacity_deferred_at` marker preserves evidence of bounded
 hold expiry even after a later reason string reports the current capacity wait.
 
@@ -98,15 +104,25 @@ waiter's age and normal-pressure opportunity.
 
 ## Review and qualification
 
-`warning_enabled` and `capacity_bypass_enabled` are false by default. The
-defaults are visible in `Coordinator.__init__`. This host activated only the
-warning route under an owned maintenance fence, preserved state/request
-identities, and restarted only its existing host coordinator. No token,
-client/bridge, Docker configuration or container changed. The capacity-fairness
-route remains disabled pending its separately owned activation window. Eight
-additional offline regressions reviewed the existing bypass implementation; all
-78 tests pass. This review did not change the installed coordinator source or
-activate capacity bypass.
+`warning_enabled` and `capacity_bypass_enabled` remain false by default in
+`Coordinator.__init__`; those defaults are not this host's live settings.
+The initial warning-only rollout and subsequent 78-test capacity review were
+separate historical steps. The reviewed fairness and queued-heartbeat source
+were activated together on November 5 at 23:19:16 UTC, under an owned
+maintenance fence with no active lease. The private activation receipt matches
+the installed config; source SHA-256 is
+`ca47224ced504fad0e3019bc07dee9ad357287d9c2770d8289db4b0e7924ce19`.
+The final 87-test suite includes nine queued-heartbeat regressions; suites
+overlap and are not additive. The fence was cleared at 23:43:28 UTC after the
+separately controlled restoration to 10 GiB and fresh-baseline checks for all
+38 services. No health, truthful-budget, active-owner or orphan rule was relaxed.
+
+Actual smaller warning-mode Nextcloud/Xelp/trailer releases were observed before
+this fairness activation. They establish bounded liveness, not full EPG parse,
+large forecast or research qualification. Nextcloud's running cron integration
+now uses the durable receipt described in [README.md](README.md). A queued
+heartbeat retains only an existing unexpired queue identity; it cannot grant,
+revive a terminal request, extend deadlines or renew an active lease.
 
 The staged tests cover the full window, mean/burst distinction, cached/stale
 observations, monotonic versus wall time, actual probe completion timing,
@@ -116,8 +132,8 @@ bounded reservations, and immediate old-job priority when it fits. Existing
 53 contract/receipt/state/liveness tests remain in the suite. Host probes and
 workloads are mocked; persistence fixtures use temporary storage.
 
-For workload qualification, begin with
-one 1536 MiB Nextcloud completion under measured quiet conditions, retain
+For continuing workload qualification, record the ordinary 1536 MiB Nextcloud
+completion together with measured quiet conditions, retain
 interactive use, and compare host swap/pressure, guest availability and service
 health across its full execution. Larger profiles require actual completions,
 not extrapolation from that first job. Only existing ordinary jobs should supply
