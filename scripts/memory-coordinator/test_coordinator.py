@@ -278,7 +278,7 @@ class AdmissionTests(unittest.TestCase):
             if "vm_stat" in args[0]:
                 return "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nSwapins: 320.\nSwapouts: 640.\n"
             return "MemAvailable: 4194304 kB\n"
-        probe = HealthProbe({"probe_container": "test-container"}, self.clock, runner)
+        probe = HealthProbe({"probe_container": "test-container"}, self.clock, runner, monotonic_clock=self.clock)
         self.assertEqual(probe.get()["guest_available_mib"], 4096)
         self.assertIsNone(probe.get()["swap_in_mib_s"])
         probe.get()
@@ -291,10 +291,11 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(len(calls), 8)
         def fail(*args, **kwargs):
             raise OSError()
-        bad = HealthProbe({"probe_container": "test-container"}, self.clock, fail)
+        bad = HealthProbe({"probe_container": "test-container"}, self.clock, fail, monotonic_clock=self.clock)
         self.assertEqual(bad.get(), {"pressure_level": None, "guest_available_mib": None,
                                     "swap_in_mib_s": None, "swap_out_mib_s": None,
-                                    "maintenance_active": False})
+                                    "maintenance_active": False, "host_observed_mono": self.clock(),
+                                    "host_interval_seconds": None, "guest_observed_mono": self.clock()})
 
     def test_maintenance_file_ttl_missing_invalid_and_unreadable(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -319,7 +320,7 @@ class AdmissionTests(unittest.TestCase):
             if "vm_stat" in args[0]:
                 return f"Mach Virtual Memory Statistics: (page size of 16384 bytes)\nSwapins: {counts[0]}.\nSwapouts: {counts[1]}.\n"
             return "MemAvailable: 4194304 kB\n"
-        probe = HealthProbe({"probe_container": "test-container"}, self.clock, runner)
+        probe = HealthProbe({"probe_container": "test-container"}, self.clock, runner, monotonic_clock=self.clock)
         probe.get()
         self.clock.advance(5)
         counts[:] = [320, 640]

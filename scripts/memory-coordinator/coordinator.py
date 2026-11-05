@@ -15,6 +15,7 @@ import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from warning_policy import WarningWindow, finite
 
 
 class APIError(Exception):
@@ -56,8 +57,9 @@ class StateFile:
 
 class HealthProbe:
     """Cached, bounded read-only probes; absence of evidence never grants a slot."""
-    def __init__(self, config, clock=time.time, runner=subprocess.check_output):
+    def __init__(self, config, clock=time.time, runner=subprocess.check_output, monotonic_clock=time.monotonic):
         self.config, self.clock, self.runner = config, clock, runner
+        self.monotonic_clock = monotonic_clock
         self.host_cache = self.guest_cache = None
         self.last_vm = None
 
@@ -83,24 +85,27 @@ class HealthProbe:
             return True
 
     def get(self):
-        now = self.clock()
-        if self.host_cache is None or now - self.host_cache[0] >= 5 or now < self.host_cache[0]:
+        now, mono = self.clock(), self.monotonic_clock()
+        if self.host_cache is None or mono - self.host_cache[0] >= 5 or mono < self.host_cache[0]:
             try:
                 level = int(self._run(["/usr/sbin/sysctl", "-n", "kern.memorystatus_vm_pressure_level"]))
                 vm = self._run(["/usr/bin/vm_stat"])
                 page_size = int(re.search(r"page size of (\d+)", vm)[1])
                 counts = [int(re.search(r"^" + key + r":\s+(\d+)\.", vm, re.M)[1]) for key in ("Swapins", "Swapouts")]
-                rates = [None, None]
+                rates, interval = [None, None], None
                 if self.last_vm is not None:
                     before, old, old_page_size = self.last_vm
-                    if now > before and page_size == old_page_size and all(a >= b for a, b in zip(counts, old)):
-                        rates = [(a - b) * page_size / 2**20 / (now - before) for a, b in zip(counts, old)]
-                self.last_vm = (now, counts, page_size)
-                self.host_cache = (now, {"pressure_level": level, "swap_in_mib_s": rates[0], "swap_out_mib_s": rates[1]})
+                    if 0 < mono - before <= 10 and page_size == old_page_size and all(a >= b for a, b in zip(counts, old)):
+                        interval = mono - before
+                        rates = [(a - b) * page_size / 2**20 / interval for a, b in zip(counts, old)]
+                self.last_vm = (mono, counts, page_size)
+                self.host_cache = (mono, {"pressure_level": level, "swap_in_mib_s": rates[0], "swap_out_mib_s": rates[1],
+                                         "host_observed_mono": mono, "host_interval_seconds": interval})
             except Exception:
                 self.last_vm = None
-                self.host_cache = (now, {"pressure_level": None, "swap_in_mib_s": None, "swap_out_mib_s": None})
-        if self.guest_cache is None or now - self.guest_cache[0] >= 15 or now < self.guest_cache[0]:
+                self.host_cache = (mono, {"pressure_level": None, "swap_in_mib_s": None, "swap_out_mib_s": None,
+                                         "host_observed_mono": mono, "host_interval_seconds": None})
+        if self.guest_cache is None or mono - self.guest_cache[0] >= 15 or mono < self.guest_cache[0]:
             try:
                 container = self.config.get("probe_container")
                 if not container:
@@ -108,9 +113,9 @@ class HealthProbe:
                 raw = self._run([self.config.get("docker_path", "/usr/local/bin/docker"),
                                  "exec", container, "cat", "/proc/meminfo"])
                 match = re.search(r"^MemAvailable:\s+(\d+)\s+kB$", raw, re.M)
-                self.guest_cache = (now, {"guest_available_mib": int(match[1]) / 1024})
+                self.guest_cache = (mono, {"guest_available_mib": int(match[1]) / 1024, "guest_observed_mono": mono})
             except Exception:
-                self.guest_cache = (now, {"guest_available_mib": None})
+                self.guest_cache = (mono, {"guest_available_mib": None, "guest_observed_mono": mono})
         # Check the maintenance fence on every admission read, independently of
         # cached pressure/guest probes, so a freshly written hold takes effect now.
         return {**self.host_cache[1], **self.guest_cache[1], "maintenance_active": self._maintenance_active(now)}
@@ -119,14 +124,30 @@ class HealthProbe:
 class Coordinator:
     TERMINAL = {"released", "cancelled", "expired"}
 
-    def __init__(self, store, health, config=None, clock=time.time):
+    def __init__(self, store, health, config=None, clock=time.time, monotonic_clock=time.monotonic):
         self.store, self.health, self.clock = store, health, clock
+        self.monotonic_clock = monotonic_clock
         self.config = {"healthy_seconds": 60, "max_peak_mib": 3072, "guest_reserve_mib": 512,
                        "max_swap_mib_s": 1,
                        "max_queue": 32, "lease_timeout_s": 30, "heartbeat_interval_s": 5,
                        "queued_owner_timeout_s": 30,
-                       "max_wait_s": 86400, "max_run_s": 86400, **(config or {})}
+                       "max_wait_s": 86400, "max_run_s": 86400,
+                       "warning_enabled": False, "warning_seconds": 300,
+                       "warning_mean_read_mib_s": 0.5, "warning_mean_write_mib_s": 0.1,
+                       "warning_burst_read_mib_s": 2, "warning_burst_write_mib_s": 1,
+                       "warning_max_probe_gap_s": 10, "capacity_bypass_enabled": False,
+                       "capacity_max_bypasses": 2, "capacity_reservation_s": 120, **(config or {})}
         number(self.config["queued_owner_timeout_s"], "queued_owner_timeout_s", 5, 300)
+        for key in ("warning_enabled", "capacity_bypass_enabled"):
+            if type(self.config[key]) is not bool:
+                raise ValueError("invalid policy switch")
+        for key, low, high in (("warning_seconds", 60, 3600), ("warning_mean_read_mib_s", 0, 1),
+                ("warning_mean_write_mib_s", 0, 1), ("warning_burst_read_mib_s", 0, 10),
+                ("warning_burst_write_mib_s", 0, 10), ("warning_max_probe_gap_s", 5, 10),
+                ("capacity_max_bypasses", 1, 5), ("capacity_reservation_s", 30, 600)):
+            number(self.config[key], key, low, high)
+        self.warning_window = WarningWindow(self.config)
+        self.capacity_reservation = {}
         self.healthy_since = None
         self.last_tick = None
         self.failed = False
@@ -148,6 +169,9 @@ class Coordinator:
         for key, value in s["requests"].items():
             if not isinstance(value, dict) or value.get("request_id") != key or value.get("state") not in self.TERMINAL | {"queued", "granted", "blocked_orphan"}:
                 raise ValueError("invalid admission request record")
+            bypasses = value.get("capacity_bypass_count", 0)
+            if type(bypasses) is not int or not 0 <= bypasses <= 5:
+                raise ValueError("invalid stored capacity fairness counter")
             required = {"queue_deadline", "peak_mib", "guest", "run_timeout_s"} if value["state"] == "queued" else set()
             if value["state"] in {"granted", "blocked_orphan"}:
                 required = {"lease_id", "run_deadline", "last_heartbeat"}
@@ -200,11 +224,13 @@ class Coordinator:
     def tick(self, owner_poll=None):
         if self.failed:
             raise APIError(503, "durable state failed; restart and inspect before admitting work")
-        now, changed = self.clock(), False
+        now, mono, changed = self.clock(), self.monotonic_clock(), False
         if self.last_tick is None or now - self.last_tick > 10 or now < self.last_tick:
             self.healthy_since = None
         self.last_tick = now
         health = self.health.get()
+        mono = self.monotonic_clock()  # Freshness must be checked after the probe finishes.
+        self.warning_window.observe(health, mono)
         maintenance = health.get("maintenance_active", False) is not False
         swap_ok = all(isinstance(health.get(k), (int, float)) and 0 <= health[k] <= self.config["max_swap_mib_s"]
                       for k in ("swap_in_mib_s", "swap_out_mib_s"))
@@ -224,6 +250,7 @@ class Coordinator:
                 self.state["queue"].remove(key)
                 self.queue_last_seen.pop(key, None)
                 changed = True
+        self.capacity_reservation = {key: value for key, value in self.capacity_reservation.items() if key in self.state["queue"]}
         active = self.state["active"]
         if active:
             item = self._request(active)
@@ -238,33 +265,73 @@ class Coordinator:
                 changed = True
         elif self.state["queue"]:
             item = self._request(self.state["queue"][0])
+            mode = None
             if maintenance:
                 reason = "maintenance window active or maintenance file invalid/unreadable"
-            elif self.healthy_since is None:
-                reason = "host pressure or swap activity elevated or unavailable"
-            elif now - self.healthy_since < self.config["healthy_seconds"]:
+            elif self.healthy_since is not None and now - self.healthy_since >= self.config["healthy_seconds"]:
+                mode, reason = "normal", None
+            elif health.get("pressure_level") == 2 and self.warning_window.ready:
+                mode, reason = "warning", None
+            elif self.healthy_since is not None:
                 reason = "waiting for stable normal host pressure"
-            elif item["peak_mib"] > self.config["max_peak_mib"]:
-                reason = "declared peak exceeds the current configured batch budget"
-            elif item["guest"] and health.get("guest_available_mib") is None:
-                reason = "guest available-memory probe unavailable"
-            elif item["guest"] and health["guest_available_mib"] < item["peak_mib"] + self.config["guest_reserve_mib"]:
-                reason = "guest available memory below declared peak plus reserve"
-            elif owner_poll != item["request_id"]:
-                reason = "waiting for the queued owner's current poll"
             else:
-                reason = None
+                reason = self.warning_window.reason if self.config["warning_enabled"] else "host pressure or swap activity elevated or unavailable"
+            bypassed = None
+            if mode is not None:
+                item, reason, bypassed = self._candidate(health, mono, mode)
+                if reason is None and owner_poll != item["request_id"]:
+                    reason = "waiting for the queued owner's current poll"
             if reason:
                 item["reason"] = reason
             else:
-                self.state["queue"].pop(0)
+                self.state["queue"].remove(item["request_id"])
                 self.queue_last_seen.pop(item["request_id"], None)
                 self.state["active"] = item["request_id"]
                 item.update(state="granted", reason=None, lease_id=secrets.token_hex(24),
-                            granted_at=now, last_heartbeat=now, run_deadline=now + item["run_timeout_s"])
+                            granted_at=now, last_heartbeat=now, run_deadline=now + item["run_timeout_s"],
+                            admission_mode=mode, bypassed_request_id=bypassed)
                 changed = True
         if changed:
             self._save()
+
+    def _capacity_reason(self, item, health, mono, mode):
+        if item["peak_mib"] > self.config["max_peak_mib"]:
+            return "declared peak exceeds the current configured batch budget"
+        if mode == "warning" and not item["guest"]:
+            return "warning_native_unqualified: host headroom has not been independently qualified"
+        if item["guest"]:
+            available = health.get("guest_available_mib")
+            if not finite(available) or available < 0:
+                return "guest available-memory probe unavailable"
+            if mode == "warning" and (not finite(health.get("guest_observed_mono")) or
+                    not 0 <= mono - health["guest_observed_mono"] <= 20):
+                return "guest available-memory probe unavailable or stale"
+            if available < item["peak_mib"] + self.config["guest_reserve_mib"]:
+                return "guest available memory below declared peak plus reserve"
+        return None
+
+    def _candidate(self, health, mono, mode):
+        head = self._request(self.state["queue"][0])
+        reason = self._capacity_reason(head, health, mono, mode)
+        if reason is None:
+            self.capacity_reservation.pop(head["request_id"], None)
+        if reason is None or not self.config["capacity_bypass_enabled"]:
+            return head, reason, None
+        head["reason"] = reason
+        if head.get("capacity_bypass_count", 0) >= self.config["capacity_max_bypasses"]:
+            deadline = self.capacity_reservation.setdefault(head["request_id"], mono + self.config["capacity_reservation_s"])
+            if mono < deadline:
+                return head, "age_reservation: waiting briefly for the oldest job's capacity", None
+            self.capacity_reservation.pop(head["request_id"], None)
+            head["capacity_bypass_count"] = 0
+            head["last_capacity_deferred_at"] = self.clock()
+            head["reason"] = "capacity_deferred: oldest job still does not fit; original queue age retained"
+            self._save()
+        for key in self.state["queue"][1:]:
+            item = self._request(key)
+            if self._capacity_reason(item, health, mono, mode) is None:
+                return item, None, head["request_id"]
+        return head, reason, None
 
     def submit(self, body):
         request_id, job = body.get("request_id"), body.get("job")
@@ -337,6 +404,11 @@ class Coordinator:
             if body.get("stopped") is not True:
                 raise APIError(409, "must confirm actual workload stopped")
             self.state["active"] = None
+            # Count completed/confirmed-stopped bypasses, not time while work is
+            # still active. A following reservation therefore starts after work.
+            older = self.state["requests"].get(item.get("bypassed_request_id"))
+            if older and older["state"] == "queued":
+                older["capacity_bypass_count"] = older.get("capacity_bypass_count", 0) + 1
         elif item["state"] == "queued" and cancel:
             self.state["queue"].remove(request_id)
             self.queue_last_seen.pop(request_id, None)
@@ -351,6 +423,7 @@ class Coordinator:
         self.tick()
         return {"active": self.state["active"], "queue": list(self.state["queue"]),
                 "healthy_since": self.healthy_since, "health": self.health.get(),
+                "warning_window": self.warning_window.view(),
                 "requests": [self._view(v) for v in self.state["requests"].values() if v["state"] not in self.TERMINAL]}
 
 

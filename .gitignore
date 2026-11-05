@@ -32,6 +32,12 @@ scripts/codex-memory-maintenance/*
 !scripts/codex-memory-maintenance/README.md
 !scripts/codex-memory-maintenance/launchagent.plist.in
 !scripts/codex-memory-maintenance/config.example.json
+!scripts/memory-coordinator/
+scripts/memory-coordinator/*
+!scripts/memory-coordinator/warning_policy.py
+!scripts/memory-coordinator/test_warning_policy.py
+!scripts/memory-coordinator/test_capacity_bypass_review.py
+!scripts/memory-coordinator/WARNING_POLICY.md
 !tests/
 !tests/**
 tests/__pycache__/

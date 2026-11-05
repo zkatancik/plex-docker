@@ -4,15 +4,38 @@ This service coordinates participating heavy jobs. It does not execute commands,
 
 ## Admission policy
 
-- Bounded FIFO queue, 32 pending requests. Older live large jobs are not bypassed by smaller newcomers. A queued owner must keep polling; 30 seconds without a poll expires only its never-granted request. Its explicit queue deadline still applies.
+- Bounded queue, 32 pending requests. With capacity bypass disabled (the current live setting), FIFO ordering does not bypass older live large jobs with smaller newcomers. A queued owner must keep polling; 30 seconds without a poll expires only its never-granted request. Its explicit queue deadline still applies.
 - Submission, status reads and background ticks never grant work. Only the FIFO head's current owner poll may claim a grant. This prevents an abandoned queue entry becoming an active orphan when memory pressure later clears.
 - One active lease globally, including Docker and participating native clients.
-- New grants require macOS pressure level 1 and measured host swap reads **and** writes each at most 1 MiB/s for 60 continuously observed seconds. An unknown probe, counter reset, pressure increase, swap burst, or observation gap longer than 10 seconds restarts the healthy window.
+- The normal route requires macOS pressure level 1 and measured host swap reads **and** writes each at most 1 MiB/s for 60 continuously observed seconds. An unknown probe, counter reset, pressure increase, swap burst, or observation gap longer than 10 seconds restarts the healthy window.
 - Host probes are cached for 5 seconds. Swap rates use `vm_stat` counter deltas and the actual host page size; nonzero historical swap occupancy does not block grants.
 - Docker jobs additionally require guest `MemAvailable >= declared peak + 512 MiB`, sampled through a configured existing container every 15 seconds. Probe errors block Docker grants. This is a conservative admission estimate, not memory reservation; normal services can consume the available memory afterward.
-- Initial maximum declared batch peak is 3,072 MiB. A declaration must describe the actual peak of the whole admitted workload. The service does not enforce that allocation; use outer Docker caps and bounded application work too.
+- This host explicitly configures a maximum declared batch peak of **4,096 MiB**, requiring at least **4,608 MiB** guest availability with the reserve. The library fallback remains 3,072 MiB; it is not the live host setting. A declaration must describe the actual peak of the whole admitted workload. The service does not enforce that allocation; use outer Docker caps and bounded application work too.
 - Native jobs share the pressure/swap gate and slot but **do not have a measured physical-headroom guarantee**. Integrate only native workloads with independently qualified peak budgets; do not interpret `guest:false` as an unrestricted host-memory permit.
 - Heartbeats continue to protect an existing lease when host pressure rises. The service never frees an occupied slot merely because its owner is late, the deadline passes, or the coordinator restarts.
+
+## Optional bounded warning route
+
+`warning_enabled` defaults to false; this host explicitly enabled it on
+2026-11-05 after review. At current pressure 2, it can admit a Docker job after
+five continuously observed quiet minutes containing only pressure 1 or 2:
+rolling swap reads <=0.5 MiB/s, writes <=0.1 MiB/s, with interval bursts over
+2/1 MiB/s resetting the window. Critical/unknown pressure, maintenance,
+missing/reset counters and observation gaps still deny new work. The first
+valid observation anchors the window without crediting earlier time. Guest
+availability must still cover the truthful declared peak plus 512 MiB.
+Native work remains on the original normal-pressure route.
+
+The separate capacity-fairness implementation is disabled on this host
+(`capacity_bypass_enabled=false`); ordinary FIFO ordering remains in effect.
+Its reviewed activation is pending the separately owned maintenance window.
+When enabled, the oldest currently fitting owner receives priority; after two
+confirmed-stopped bypasses, a 120-second reservation gives the old head an
+opportunity to fit before eligible smaller work resumes. Budgets, health gates,
+and one-slot ownership remain unchanged. This does not guarantee admission for
+a workload that never fits, or retain age across abandoned/new request UUIDs.
+See [WARNING_POLICY.md](WARNING_POLICY.md) for sources, exact behavior,
+qualification limits and the request-age limitation across client retries.
 
 ## Configuration and first installation
 
@@ -29,7 +52,9 @@ Example config contains no credential. Put real config/state/token outside repos
   "maintenance_file": "/Users/zack/.config/docker-stack-guardian/maintenance-until",
   "healthy_seconds": 60,
   "max_swap_mib_s": 1,
-  "max_peak_mib": 3072,
+  "max_peak_mib": 4096,
+  "warning_enabled": true,
+  "capacity_bypass_enabled": false,
   "guest_reserve_mib": 512,
   "max_queue": 32,
   "queued_owner_timeout_s": 30,
@@ -63,7 +88,8 @@ expired positive deadlines release the fence; invalid, oversized or unreadable
 files fail closed. The file is checked on every health read, independently of the
 probe caches. Existing owners may keep heartbeating and finish safely during the
 hold; maintenance does not falsely release their slot. Clearing/expiring the
-fence still requires a fresh 60-second healthy observation window before new work.
+fence still requires fresh qualification: 60 seconds for the normal route, or
+300 continuously observed quiet seconds for the enabled warning route.
 
 ## Network-isolated clients
 
