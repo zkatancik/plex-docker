@@ -372,6 +372,28 @@ class Coordinator:
         self.tick(owner_poll=request_id)
         return self._view(self._request(request_id))
 
+    def queued_heartbeat(self, request_id, body):
+        """Keep a pending owner present without providing a grant-capable poll."""
+        if type(body) is not dict or body:
+            raise APIError(400, "queued heartbeat requires an empty JSON object")
+        item = self._request(request_id)
+        if (item["state"] != "queued" or item.get("lease_id") is not None
+                or any(key in item for key in ("granted_at", "run_deadline", "last_heartbeat"))):
+            raise APIError(409, "only an unexpired queued request may send a queued heartbeat")
+        # Expire an already absent owner/deadline before refreshing presence.
+        # No owner_poll is supplied, so even a ready FIFO head cannot acquire.
+        self.tick()
+        item = self._request(request_id)
+        if item["state"] != "queued":
+            raise APIError(409, "queued request expired before heartbeat")
+        now = self.clock()
+        if (now >= item["queue_deadline"] or
+                now - self.queue_last_seen[request_id] >= self.config["queued_owner_timeout_s"]):
+            self.tick()  # A slow probe must not let elapsed deadlines revive.
+            raise APIError(409, "queued request expired before heartbeat")
+        self.queue_last_seen[request_id] = now
+        return self._view(item)
+
     def heartbeat(self, request_id, body):
         self.tick()
         item = self._request(request_id)
@@ -438,6 +460,8 @@ def dispatch(engine, method, endpoint, body):
             return engine.get(path[2])
         if method == "POST" and len(path) == 4 and path[3] == "heartbeat":
             return engine.heartbeat(path[2], body)
+        if method == "POST" and len(path) == 4 and path[3] == "queued-heartbeat":
+            return engine.queued_heartbeat(path[2], body)
         if method == "POST" and len(path) == 4 and path[3] in {"release", "cancel"}:
             return engine.finish(path[2], body, cancel=path[3] == "cancel")
     raise APIError(404, "unknown endpoint")

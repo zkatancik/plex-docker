@@ -138,6 +138,24 @@ New submissions return `queued`, even when the host is healthy. Submitting the s
 
 The queued-owner timeout defaults to 30 seconds (configurable from 5 to 300). On coordinator restart, previously queued requests get a fresh timeout grace to resume polling, but none can be granted without a current poll. Active/granted/orphan requests never expire through this queue mechanism. An already expired request cannot revive; submit a new UUID for a later attempt.
 
+`POST /v1/requests/{id}/queued-heartbeat` with **exactly `{}`** refreshes only
+the liveness of an unexpired queued request. It never supplies a grant-capable
+owner poll, even when that request is first and all health/capacity gates are
+ready. The response remains `state == "queued"`; creation time, queue deadline,
+declared budget and queue order remain unchanged. This lets an application keep
+one logical pending request while releasing its local dispatch lock, then use
+GET to claim only after it can actually run the work. Keep regular queued
+heartbeats below the owner timeout and retain a bounded overall queue deadline.
+Cancel the queued request when the logical work is abandoned.
+
+The empty body means an empty JSON object, not zero bytes. Any key, including
+`lease_id`, or a non-object/malformed body returns 400. Unknown IDs return 404;
+terminal, granted, orphaned, lease-bearing, deadline-past or already timed-out
+queued requests return 409. An elapsed owner timeout is checked before presence
+is refreshed, so the endpoint cannot revive a request between background ticks.
+It does not renew an active lease, extend any deadline, recover an orphan, or
+claim another request. Existing POST-then-GET clients remain unchanged.
+
 `POST /v1/requests/{id}/heartbeat` with `{"lease_id":"..."}`. Require both HTTP 200 **and** `state == "granted"`. A late owner or restarted coordinator can recover the same lease identity before its original runtime deadline. No new owner can enter during that recovery. After the runtime deadline, heartbeat returns `blocked_orphan`; the client must stop work. There is no deadline extension API.
 
 `POST /v1/requests/{id}/release` with `{"lease_id":"...","stopped":true}` only after the actual work has finished or been stopped and joined. Release is durable before the next grant. Terminal responses are idempotent.

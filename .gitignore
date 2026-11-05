@@ -37,6 +37,7 @@ scripts/memory-coordinator/*
 !scripts/memory-coordinator/warning_policy.py
 !scripts/memory-coordinator/test_warning_policy.py
 !scripts/memory-coordinator/test_capacity_bypass_review.py
+!scripts/memory-coordinator/test_queued_heartbeat.py
 !scripts/memory-coordinator/WARNING_POLICY.md
 !tests/
 !tests/**
