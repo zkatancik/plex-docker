@@ -9,6 +9,7 @@ LOG_FILE="${LOG_DIR}/guardian.log"
 LOCK_DIR="${HOME}/Library/Caches/docker-stack-guardian.lock"
 CONFIG_DIR="${HOME}/.config/docker-stack-guardian"
 DISABLED_FILE="${CONFIG_DIR}/disabled-stacks"
+MAINTENANCE_FILE="${CONFIG_DIR}/maintenance-until"
 
 /bin/mkdir -p "${LOG_DIR}" "${HOME}/Library/Caches" "${CONFIG_DIR}"
 
@@ -25,6 +26,16 @@ if ! /bin/mkdir "${LOCK_DIR}" 2>/dev/null; then
   exit 0
 fi
 trap finish EXIT INT TERM
+
+# A bounded maintenance window lets deliberate deploys/restarts finish without
+# the watchdog racing them. An abandoned window expires automatically.
+if [[ -f "${MAINTENANCE_FILE}" ]]; then
+  maintenance_until="$(<"${MAINTENANCE_FILE}")"
+  if [[ "${maintenance_until}" == <-> && "${maintenance_until}" -gt "$(/bin/date +%s)" ]]; then
+    log "Scheduled maintenance is active; skipping recovery"
+    exit 0
+  fi
+fi
 
 if [[ ! -x "${DOCKER}" ]] || ! "${DOCKER}" info >/dev/null 2>&1; then
   log "Docker is not ready; the next scheduled run will retry"
@@ -76,12 +87,14 @@ recover_stack() {
 
   local -a services
   local -a unavailable
+  local -a recovery_services
   local -a env_args
   local service
   local state
 
   services=("$@")
   unavailable=()
+  recovery_services=()
   env_args=()
   if [[ -n "${env_file}" ]]; then
     env_args=(--env-file "${env_file}")
@@ -109,6 +122,7 @@ recover_stack() {
     fi
     if [[ "${state}" != "running" ]]; then
       unavailable+=("${service}:${state}")
+      recovery_services+=("${service}")
     fi
   done
 
@@ -117,6 +131,11 @@ recover_stack() {
   fi
 
   log "${stack_name} recovery required (${unavailable[*]})"
+  # VPN dependents share Gluetun's network namespace and must move together if
+  # that owner is replaced. Other stacks recover only unavailable services.
+  if [[ "${stack_name}" == "plex-vpn" && " ${recovery_services[*]} " == *" gluetun "* ]]; then
+    recovery_services=("${services[@]}")
+  fi
   if (
     cd "${project_dir}" &&
     "${DOCKER}" compose \
@@ -124,7 +143,7 @@ recover_stack() {
       --project-directory "${project_dir}" \
       --file "${compose_file}" \
       "${env_args[@]}" \
-      up --detach --force-recreate "${services[@]}"
+      up --detach --no-deps --force-recreate "${recovery_services[@]}"
   ) >>"${LOG_FILE}" 2>&1; then
     log "${stack_name} recovery command completed"
     return 0

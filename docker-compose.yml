@@ -231,6 +231,7 @@ services:
       - vpn_net
     environment:
       - TZ=${TZ}
+      - UN_PARALLEL=1
       - UN_SONARR_0_URL=http://sonarr:8989
       - UN_SONARR_0_API_KEY=${SONARR_API_KEY}
       - UN_SONARR_0_PATH=/data/downloads
@@ -268,6 +269,8 @@ services:
       - RADARR_DETACHED_CATEGORY=radarr-rejected
       - MIN_SEED_TIME_SECONDS=2592000
       - MAX_ACTIVE_DOWNLOADS=3
+      - MAX_PEER_CONNECTIONS=300
+      - MAX_PEER_CONNECTIONS_PER_TORRENT=50
       - UNMATCHED_GRACE_SECONDS=2592000
       - RETENTION_STATE_PATH=/state/retention-state.json
       - UNMONITORED_EVICTION_ENABLED=true
@@ -411,8 +414,13 @@ services:
     container_name: agregarr
     environment:
       - TZ=${TZ}
+      - MEMORY_COORDINATOR_URL=http://host.docker.internal:8766
+      - MEMORY_COORDINATOR_TOKEN_FILE=/run/secrets/memory-coordinator-token
     volumes:
       - /Users/zack/plex-docker/agregarr:/app/config
+      - /Users/zack/plex-docker/containers/agregarr/trailer-postprocessor.sh:/app/config/trailer-postprocessor.sh:ro
+      - /Users/zack/.config/home-memory-coordinator/client.py:/opt/memory-coordinator/client.py:ro
+      - /Users/zack/.config/home-memory-coordinator/token:/run/secrets/memory-coordinator-token:ro
       - /Users/zack/plex-docker/agregarr/yt-dlp.conf:/etc/yt-dlp.conf:ro
       - /Volumes/HomeLabPool/placeholders/movies:/data/movies
       - /Volumes/HomeLabPool/placeholders/tv:/data/tv
@@ -434,8 +442,13 @@ services:
       - agregarr
     environment:
       - TZ=${TZ}
+      - MEMORY_COORDINATOR_URL=http://host.docker.internal:8766
+      - MEMORY_COORDINATOR_TOKEN_FILE=/run/secrets/memory-coordinator-token
     volumes:
       - /Users/zack/plex-docker/agregarr:/app/config
+      - /Users/zack/plex-docker/containers/agregarr/trailer-postprocessor.sh:/app/config/trailer-postprocessor.sh:ro
+      - /Users/zack/.config/home-memory-coordinator/client.py:/opt/memory-coordinator/client.py:ro
+      - /Users/zack/.config/home-memory-coordinator/token:/run/secrets/memory-coordinator-token:ro
       - /Volumes/HomeLabPool/placeholders/movies:/data/movies
       - /Volumes/HomeLabPool/placeholders/tv:/data/tv
     command: sh /app/config/trailer-watcher.sh

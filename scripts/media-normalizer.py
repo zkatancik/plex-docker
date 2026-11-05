@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import configparser
 import contextlib
+from collections import deque
 import datetime as dt
 import fcntl
 import hashlib
@@ -22,6 +23,7 @@ import os
 import plistlib
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -426,6 +428,8 @@ def run_process(
     timeout: Optional[float] = None,
     check: bool = True,
 ) -> subprocess.CompletedProcess:
+    if Path(command[0]).name == "ffmpeg":
+        return run_bounded_ffmpeg(command, timeout=timeout, check=check)
     try:
         result = subprocess.run(
             list(command),
@@ -443,6 +447,116 @@ def run_process(
             "command exited %d (%s): %s"
             % (result.returncode, Path(command[0]).name, detail)
         )
+    return result
+
+
+@contextlib.contextmanager
+def _defer_stop_signals() -> Iterator[None]:
+    """Finish joining owned work before honoring a new stop request."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    pending: List[int] = []
+    unwinding = sys.exc_info()[0] is not None
+    previous = {}
+
+    def defer(received: int, _frame: Any) -> None:
+        if not pending:
+            pending.append(received)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        previous[sig] = signal.signal(sig, defer)
+    try:
+        yield
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+    if pending and not unwinding:
+        handler = previous[pending[0]]
+        if callable(handler):
+            handler(pending[0], None)
+            return
+        if handler == signal.SIG_IGN:
+            return
+        if pending[0] == signal.SIGINT:
+            raise KeyboardInterrupt
+        raise SystemExit(128 + pending[0])
+
+
+def run_bounded_ffmpeg(
+    command: Sequence[str], *, timeout: Optional[float], check: bool
+) -> subprocess.CompletedProcess:
+    """Bound decoder/filter threads and output capture; admit each native batch."""
+    bounded = [command[0], "-nostats", "-filter_threads", "2", "-filter_complex_threads", "2"]
+    for argument in command[1:-1]:
+        if argument == "-i":
+            bounded.extend(["-threads", "2"])
+        bounded.append(argument)
+    bounded.extend(["-threads", "2", command[-1]])
+    endpoint = os.environ.get("MEDIA_NORMALIZER_MEMORY_COORDINATOR_URL", "")
+    wrapped = bool(endpoint)
+    wall_timeout = timeout
+    if wrapped:
+        client = Path(os.environ.get("MEDIA_NORMALIZER_MEMORY_CLIENT_FILE", ""))
+        token = Path(os.environ.get("MEDIA_NORMALIZER_MEMORY_TOKEN_FILE", ""))
+        if not client.is_file() or not token.is_file():
+            raise NormalizerError("media memory admission requires client and token files")
+        try:
+            peak = int(os.environ.get("MEDIA_NORMALIZER_MEMORY_PEAK_MIB", "1536"))
+            wait = int(os.environ.get("MEDIA_NORMALIZER_MEMORY_WAIT_SECONDS", "86400"))
+            runtime = int(math.ceil(timeout if timeout is not None else 7200))
+            if not 1 <= peak <= 3072 or not 1 <= wait <= 86400 or not 1 <= runtime <= 86400:
+                raise ValueError("out of bounds")
+        except ValueError as exc:
+            raise NormalizerError("invalid media memory admission budget") from exc
+        bounded = [sys.executable, str(client), "--url", endpoint, "--token-file", str(token),
+                   "run", "--job", "native-media-normalizer", "--peak-mib", str(peak),
+                   "--run-timeout", str(runtime), "--wait-timeout", str(wait), "--native", "--", *bounded]
+        wall_timeout = wait + runtime + 60  # Admission wait does not consume encode time.
+
+    process = None
+    readers = []
+    tails = [deque(maxlen=8), deque(maxlen=8)]  # At most 64 KiB retained per stream.
+
+    def read_tail(stream, tail):
+        try:
+            while True:
+                chunk = stream.read(8192)
+                if not chunk:
+                    return
+                tail.append(chunk)
+        finally:
+            stream.close()
+
+    def stop_owned():
+        if process is not None and process.poll() is None:
+            process.terminate()  # Wrapper needs time to stop/join its child and release.
+            try:
+                process.wait(timeout=40 if wrapped else 5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+
+    try:
+        process = subprocess.Popen(bounded, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        for stream, tail in zip((process.stdout, process.stderr), tails):
+            reader = threading.Thread(target=read_tail, args=(stream, tail), daemon=True)
+            reader.start()
+            readers.append(reader)
+        process.wait(timeout=wall_timeout)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise NormalizerError("ffmpeg subprocess failed: %s" % type(exc).__name__) from exc
+    finally:
+        with _defer_stop_signals():
+            stop_owned()
+            for reader in readers:
+                reader.join(timeout=5)
+    result = subprocess.CompletedProcess(list(command), process.returncode,
+        b"".join(tails[0]).decode("utf-8", errors="replace"),
+        b"".join(tails[1]).decode("utf-8", errors="replace"))
+    if check and result.returncode != 0:
+        raise NormalizerError("command exited %d (ffmpeg): %s" % (
+            result.returncode, (result.stderr or result.stdout).strip()[-4000:]))
     return result
 
 
@@ -1978,7 +2092,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def _main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "normalize" and args.sonarr_series_id is not None and args.season is None:
         raise SystemExit("--season is required with --sonarr-series-id")
@@ -2019,6 +2133,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except (NormalizerError, OSError) as exc:
         log("fatal: %s" % exc, settings, stderr=True)
         return 1
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    stopping = False
+
+    def request_stop(received: int, _frame: Any) -> None:
+        nonlocal stopping
+        if stopping:
+            return  # Repeated signals must not interrupt child/lock cleanup.
+        stopping = True
+        if received == signal.SIGINT:
+            raise KeyboardInterrupt
+        raise SystemExit(128 + received)
+
+    previous = {}
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        previous[sig] = signal.signal(sig, request_stop)
+    try:
+        return _main(argv)
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
 
 
 if __name__ == "__main__":

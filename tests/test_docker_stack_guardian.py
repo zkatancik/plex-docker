@@ -9,6 +9,36 @@ SCRIPT = Path(__file__).resolve().parents[1] / 'scripts/docker-stack-guardian.sh
 
 
 class GuardianDiscoveryTests(unittest.TestCase):
+    def recovery_command(self, stack, missing, services):
+        source = SCRIPT.read_text()
+        functions = source[source.index('recover_stack()'):source.index('failures=0')]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            compose = root / 'compose.yaml'
+            compose.touch()
+            docker = root / 'docker'
+            docker.write_text('#!/bin/sh\nprintf "%s\\n" "$*" > "$CALLS"\n')
+            docker.chmod(0o755)
+            code = '''stack_disabled() { return 1; }
+log() { :; }
+service_state() { if [[ "$2" == "$MISSING_SERVICE" ]]; then echo exited; else echo running; fi; }
+''' + functions + '\nrecover_stack "$STACK" "$ROOT" "$COMPOSE" "" project "$@"\n'
+            env = dict(os.environ, DOCKER=str(docker), LOG_FILE=str(root / 'log'),
+                       CALLS=str(root / 'calls'), ROOT=directory, COMPOSE=str(compose),
+                       MISSING_SERVICE=missing, STACK=stack)
+            result = subprocess.run(['/bin/zsh', '-c', code, 'test', *services],
+                                    env=env, capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return (root / 'calls').read_text().strip()
+
+    def test_nextcloud_failure_does_not_recreate_healthy_database(self):
+        command = self.recovery_command('nextcloud', 'cron', ['db', 'redis', 'app', 'cron'])
+        self.assertTrue(command.endswith('up --detach --no-deps --force-recreate cron'), command)
+
+    def test_vpn_owner_replacement_moves_namespace_dependents(self):
+        command = self.recovery_command('plex-vpn', 'gluetun', ['gluetun', 'qbittorrent', 'flaresolverr'])
+        self.assertTrue(command.endswith('--force-recreate gluetun qbittorrent flaresolverr'), command)
+
     def run_probe(self, failure=False, missing=False):
         source = SCRIPT.read_text()
         functions = source[source.index('service_state()'):source.index('failures=0')]

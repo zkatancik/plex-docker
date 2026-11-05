@@ -1,10 +1,14 @@
+import contextlib
 import importlib.util
+import io
 import json
 import os
+import signal
 import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import unittest
 from fractions import Fraction
@@ -179,6 +183,109 @@ class DetectionPolicyTests(unittest.TestCase):
 
 
 class StateAndLoggingTests(unittest.TestCase):
+    def test_signals_stop_admitted_child_before_unlocking_even_when_repeated(self):
+        """A real short child proves cleanup survives launchd TERM and repeated INT."""
+        for initial_signal in (signal.SIGTERM, signal.SIGINT):
+            with self.subTest(signal=initial_signal), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                child = root / "ffmpeg"
+                child.write_text("#!" + sys.executable + "\n" + textwrap.dedent('''\
+                    import os, signal, time
+                    from pathlib import Path
+                    root = Path(os.environ["SIGNAL_FIXTURE_ROOT"])
+                    stopping = False
+                    def stop(*_):
+                        global stopping
+                        stopping = True
+                    signal.signal(signal.SIGTERM, stop)
+                    (root / "child.pid").write_text(str(os.getpid()))
+                    end = time.monotonic() + 5
+                    while not stopping and time.monotonic() < end:
+                        time.sleep(.01)
+                    (root / "child.stopping").touch()
+                    time.sleep(.3)
+                    (root / "child.stopped").touch()
+                    '''))
+                child.chmod(0o755)
+                wrapper = root / "client.py"
+                wrapper.write_text(textwrap.dedent('''\
+                    import os, signal, subprocess, sys, time
+                    from pathlib import Path
+                    root = Path(os.environ["SIGNAL_FIXTURE_ROOT"])
+                    stopping = False
+                    def stop(*_):
+                        global stopping
+                        stopping = True
+                    signal.signal(signal.SIGTERM, stop)
+                    signal.signal(signal.SIGINT, stop)
+                    (root / "wrapper.pid").write_text(str(os.getpid()))
+                    child = subprocess.Popen(sys.argv[sys.argv.index("--") + 1:], start_new_session=True)
+                    while child.poll() is None and not stopping:
+                        time.sleep(.01)
+                    if child.poll() is None:
+                        os.killpg(child.pid, signal.SIGTERM)
+                    child.wait()
+                    (root / "lease.released").touch()
+                    '''))
+                token = root / "token"
+                token.write_text("fixture only")
+                harness = textwrap.dedent('''\
+                    import importlib.util, os, sys
+                    from pathlib import Path
+                    from types import SimpleNamespace
+                    spec = importlib.util.spec_from_file_location("normalizer_fixture", sys.argv[1])
+                    module = importlib.util.module_from_spec(spec)
+                    sys.modules[spec.name] = module
+                    spec.loader.exec_module(module)
+                    root = Path(os.environ["SIGNAL_FIXTURE_ROOT"])
+                    module.load_settings = lambda: SimpleNamespace(
+                        lock_path=root / "process.lock", media_mutation_lock_path=root / "mutation.lock")
+                    def poll(*args, **kwargs):
+                        module.run_process([str(root / "ffmpeg"), "-f", "null", "-"], timeout=10)
+                        return 0
+                    module.run_poll = poll
+                    raise SystemExit(module.main(["poll"]))
+                    ''')
+                env = dict(os.environ, SIGNAL_FIXTURE_ROOT=str(root),
+                           MEDIA_NORMALIZER_MEMORY_COORDINATOR_URL="http://fixture.invalid",
+                           MEDIA_NORMALIZER_MEMORY_CLIENT_FILE=str(wrapper),
+                           MEDIA_NORMALIZER_MEMORY_TOKEN_FILE=str(token))
+                process = subprocess.Popen([sys.executable, "-c", harness, str(MODULE_PATH)],
+                                           env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                           start_new_session=True)
+                try:
+                    deadline = time.monotonic() + 3
+                    while not (root / "child.pid").exists() and time.monotonic() < deadline:
+                        time.sleep(.01)
+                    self.assertTrue((root / "child.pid").exists())
+                    self.assertTrue((root / "mutation.lock").is_dir())
+                    process.send_signal(initial_signal)
+                    deadline = time.monotonic() + 2
+                    while not (root / "child.stopping").exists() and time.monotonic() < deadline:
+                        time.sleep(.01)
+                    self.assertTrue((root / "child.stopping").exists())
+                    self.assertIsNone(process.poll(), "parent must wait for the physical child")
+                    self.assertTrue((root / "mutation.lock").is_dir())
+                    process.send_signal(signal.SIGTERM)
+                    process.send_signal(signal.SIGINT)
+                    process.communicate(timeout=3)
+                    self.assertTrue((root / "child.stopped").exists())
+                    self.assertTrue((root / "lease.released").exists())
+                    self.assertFalse((root / "mutation.lock").exists())
+                    expected = 143 if initial_signal == signal.SIGTERM else -signal.SIGINT
+                    self.assertEqual(process.returncode, expected)
+                    with media_normalizer.process_lock(root / "process.lock"):
+                        pass
+                finally:
+                    # A red regression must not leave its fixture wrapper/child behind.
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(process.pid, signal.SIGTERM)
+                    try:
+                        process.communicate(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.communicate()
+
     def test_shared_media_mutation_lock_is_atomic_and_removed_on_exit(self):
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / "locks/media.lock"
@@ -229,6 +336,54 @@ class StateAndLoggingTests(unittest.TestCase):
         with mock.patch.object(subprocess, "run", side_effect=OSError("gone")):
             with self.assertRaises(media_normalizer.NormalizerError):
                 media_normalizer.run_process(["missing"])
+
+    def test_ffmpeg_capture_and_all_input_threads_are_bounded(self):
+        process = mock.Mock(returncode=0)
+        process.stdout = io.BytesIO(b"a" * 200000)
+        process.stderr = io.BytesIO(b"b" * 200000 +
+                                   b"\n[Parsed_ssim] SSIM Y:0.99 All:0.990000\n"
+                                   b"[Parsed_psnr] PSNR y:42.1 average:42.100000 min:40.0\n")
+        process.poll.return_value = 0
+        with mock.patch.dict(os.environ, {"MEDIA_NORMALIZER_MEMORY_COORDINATOR_URL": ""}), \
+             mock.patch.object(subprocess, "Popen", return_value=process) as launch:
+            result = media_normalizer.run_process(["ffmpeg", "-i", "first", "-i", "second", "-f", "null", "-"], timeout=180)
+        self.assertLessEqual(len(result.stdout), 65536)
+        self.assertLessEqual(len(result.stderr), 65536)
+        self.assertEqual(media_normalizer.metric_value(result.stderr, "ssim"), 0.99)
+        self.assertEqual(media_normalizer.metric_value(result.stderr, "psnr"), 42.1)
+        command = launch.call_args.args[0]
+        self.assertEqual(command.count("-threads"), 3)
+        self.assertIn("-nostats", command)
+        for index, value in enumerate(command):
+            if value == "-threads":
+                self.assertEqual(command[index + 1], "2")
+
+    def test_ffmpeg_admission_wait_is_separate_from_encode_timeout(self):
+        with tempfile.TemporaryDirectory() as root:
+            client, token = Path(root) / "client.py", Path(root) / "token"
+            client.write_text("# fixture")
+            token.write_text("fixture only")
+            process = mock.Mock(returncode=0)
+            process.stdout, process.stderr = io.BytesIO(b""), io.BytesIO(b"")
+            process.poll.return_value = 0
+            with mock.patch.dict(os.environ, {"MEDIA_NORMALIZER_MEMORY_COORDINATOR_URL": "http://127.0.0.1:8766",
+                    "MEDIA_NORMALIZER_MEMORY_CLIENT_FILE": str(client), "MEDIA_NORMALIZER_MEMORY_TOKEN_FILE": str(token),
+                    "MEDIA_NORMALIZER_MEMORY_WAIT_SECONDS": "900"}), \
+                 mock.patch.object(subprocess, "Popen", return_value=process) as launch:
+                media_normalizer.run_process(["ffmpeg", "-i", "fixture", "-f", "null", "-"], timeout=180)
+            command = launch.call_args.args[0]
+            self.assertIn("--native", command)
+            self.assertEqual(command[command.index("--run-timeout") + 1], "180")
+            self.assertEqual(command[command.index("--wait-timeout") + 1], "900")
+            process.wait.assert_called_once_with(timeout=1140)
+
+    def test_ffmpeg_missing_admission_credentials_fails_closed(self):
+        with mock.patch.dict(os.environ, {"MEDIA_NORMALIZER_MEMORY_COORDINATOR_URL": "http://127.0.0.1:8766",
+                "MEDIA_NORMALIZER_MEMORY_CLIENT_FILE": "/missing/client.py", "MEDIA_NORMALIZER_MEMORY_TOKEN_FILE": "/missing/token"}), \
+             mock.patch.object(subprocess, "Popen") as launch:
+            with self.assertRaises(media_normalizer.NormalizerError):
+                media_normalizer.run_process(["ffmpeg", "-i", "fixture", "-f", "null", "-"], timeout=180)
+            launch.assert_not_called()
 
     def test_first_real_poll_establishes_watermark_without_enumerating_media(self):
         with tempfile.TemporaryDirectory() as root:

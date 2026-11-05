@@ -279,6 +279,17 @@ class CleanupRunTests(unittest.TestCase):
 
 
 class ShareLimitTests(unittest.TestCase):
+    def test_unlimited_peers_are_bounded_without_stopping_seeds(self):
+        updates = download_cleanup.required_preference_updates({"max_connec": -1, "max_connec_per_torrent": -1, "max_active_uploads": 3})
+        self.assertEqual(300, updates["max_connec"])
+        self.assertEqual(50, updates["max_connec_per_torrent"])
+        self.assertEqual(-1, updates["max_active_uploads"])
+
+    def test_tighter_peer_limits_are_preserved(self):
+        updates = download_cleanup.required_preference_updates({"max_connec": 100, "max_connec_per_torrent": 20})
+        self.assertNotIn("max_connec", updates)
+        self.assertNotIn("max_connec_per_torrent", updates)
+
     def test_queueing_limits_downloads_without_limiting_seeding(self):
         updates = download_cleanup.required_preference_updates(
             {

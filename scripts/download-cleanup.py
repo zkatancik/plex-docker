@@ -124,6 +124,8 @@ RELEASE_RESIDUE_EXTS = ARCHIVE_EXTS | RELEASE_SIDECAR_EXTS
 SEED_MIN_SECONDS = int(os.environ.get("MIN_SEED_TIME_SECONDS", 30 * 24 * 3600))
 SEED_MIN_MINUTES = (SEED_MIN_SECONDS + 59) // 60
 MAX_ACTIVE_DOWNLOADS = int(os.environ.get("MAX_ACTIVE_DOWNLOADS", 3))
+MAX_PEER_CONNECTIONS = int(os.environ.get("MAX_PEER_CONNECTIONS", 300))
+MAX_PEER_CONNECTIONS_PER_TORRENT = int(os.environ.get("MAX_PEER_CONNECTIONS_PER_TORRENT", 50))
 UNMATCHED_GRACE_SECONDS = int(os.environ.get("UNMATCHED_GRACE_SECONDS", 30 * 24 * 3600))
 STATE_VERSION = 1
 TRUE_VALUES = {"1", "true", "yes", "on"}
@@ -1572,6 +1574,13 @@ def declutter_linked_folder(
 def required_preference_updates(preferences: dict) -> dict[str, object]:
     """Keep retention safe and bound concurrent downloads without limiting uploads."""
     updates: dict[str, object] = {}
+    # Bound per-peer buffers while keeping every completed torrent eligible to
+    # seed. Respect manually chosen tighter limits, including zero.
+    for key, ceiling in (("max_connec", MAX_PEER_CONNECTIONS),
+                         ("max_connec_per_torrent", MAX_PEER_CONNECTIONS_PER_TORRENT)):
+        current = int(preferences.get(key, -1))
+        if ceiling > 0 and (current < 0 or current > ceiling):
+            updates[key] = ceiling
     current_limit = int(preferences.get("max_seeding_time", -1))
     if not preferences.get("max_seeding_time_enabled"):
         updates["max_seeding_time_enabled"] = True
