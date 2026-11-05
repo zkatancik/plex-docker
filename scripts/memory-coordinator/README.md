@@ -4,7 +4,8 @@ This service coordinates participating heavy jobs. It does not execute commands,
 
 ## Admission policy
 
-- Bounded FIFO queue, 32 pending requests. Older large jobs are not bypassed by smaller newcomers. Queue deadlines eventually remove abandoned waiters.
+- Bounded FIFO queue, 32 pending requests. Older live large jobs are not bypassed by smaller newcomers. A queued owner must keep polling; 30 seconds without a poll expires only its never-granted request. Its explicit queue deadline still applies.
+- Submission, status reads and background ticks never grant work. Only the FIFO head's current owner poll may claim a grant. This prevents an abandoned queue entry becoming an active orphan when memory pressure later clears.
 - One active lease globally, including Docker and participating native clients.
 - New grants require macOS pressure level 1 and measured host swap reads **and** writes each at most 1 MiB/s for 60 continuously observed seconds. An unknown probe, counter reset, pressure increase, swap burst, or observation gap longer than 10 seconds restarts the healthy window.
 - Host probes are cached for 5 seconds. Swap rates use `vm_stat` counter deltas and the actual host page size; nonzero historical swap occupancy does not block grants.
@@ -31,6 +32,7 @@ Example config contains no credential. Put real config/state/token outside repos
   "max_peak_mib": 3072,
   "guest_reserve_mib": 512,
   "max_queue": 32,
+  "queued_owner_timeout_s": 30,
   "heartbeat_interval_s": 5,
   "lease_timeout_s": 30
 }
@@ -104,15 +106,17 @@ All endpoints require `Authorization: Bearer <token>`. All successful operations
 }
 ```
 
-Submitting the same ID and parameters is idempotent. Reusing an ID for different work returns 409. IDs must be 8–80 letters/digits/hyphens/underscores; job names are at most 100 characters. Wait/run timeouts must be positive and at most 86,400 seconds. Only 128 terminal records are retained, so UUIDs must never intentionally be reused.
+New submissions return `queued`, even when the host is healthy. Submitting the same ID and parameters is idempotent; it does not refresh queued-owner liveness. Reusing an ID for different work returns 409. IDs must be 8–80 letters/digits/hyphens/underscores; job names are at most 100 characters. Wait/run timeouts must be positive and at most 86,400 seconds. Only 128 terminal records are retained, so UUIDs must never intentionally be reused.
 
-`GET /v1/requests/{request_id}` polls state, normally every two seconds. States are `queued`, `granted`, `blocked_orphan`, `released`, `cancelled`, `expired`. Responses include `request_id`, `reason`, `heartbeat_interval_s` (5), `lease_timeout_s` (30), and the original parameters. A granted response adds opaque `lease_id` and numeric Unix-epoch-seconds `run_deadline`. `run_deadline` is omitted while queued. The runtime budget starts at grant, not at the client's later work start.
+`GET /v1/requests/{request_id}` is an **owner poll and claim**, normally every two seconds. For queued work it refreshes liveness and may grant that exact head request. Use `/v1/status` for observational monitoring, not this endpoint. States are `queued`, `granted`, `blocked_orphan`, `released`, `cancelled`, `expired`. Responses include `request_id`, `reason`, `heartbeat_interval_s` (5), `lease_timeout_s` (30), and the original parameters. A granted response adds opaque `lease_id` and numeric Unix-epoch-seconds `run_deadline`. `run_deadline` is omitted while queued. The runtime budget starts at grant, not at the client's later work start. Existing clients that POST then poll GET remain compatible.
+
+The queued-owner timeout defaults to 30 seconds (configurable from 5 to 300). On coordinator restart, previously queued requests get a fresh timeout grace to resume polling, but none can be granted without a current poll. Active/granted/orphan requests never expire through this queue mechanism. An already expired request cannot revive; submit a new UUID for a later attempt.
 
 `POST /v1/requests/{id}/heartbeat` with `{"lease_id":"..."}`. Require both HTTP 200 **and** `state == "granted"`. A late owner or restarted coordinator can recover the same lease identity before its original runtime deadline. No new owner can enter during that recovery. After the runtime deadline, heartbeat returns `blocked_orphan`; the client must stop work. There is no deadline extension API.
 
 `POST /v1/requests/{id}/release` with `{"lease_id":"...","stopped":true}` only after the actual work has finished or been stopped and joined. Release is durable before the next grant. Terminal responses are idempotent.
 
-`POST /v1/requests/{id}/cancel` cancels queued work. If the request raced with a grant, supply the lease identity and `stopped:true`. Recover an unknown identity with a bounded cleanup GET. If the network prevents cleanup, do not start work; the orphan holds the slot safely.
+`POST /v1/requests/{id}/cancel` cancels queued work. Attempt this first on failed acquisition, without a GET that could claim a grant. If a lost response hid a grant, supply the lease identity and `stopped:true`; recover the exact unknown identity with a bounded cleanup GET only when the caller can prove it never started work. If the network prevents cleanup, do not start work; an unclaimed queue entry expires, while an uncertain grant holds the slot safely.
 
 `GET /v1/status` returns active ID, FIFO IDs, health measurements, healthy-since timestamp, and nonterminal requests. It does not return bearer credentials or command lines.
 
@@ -138,6 +142,31 @@ AlgoForge uses this to exclude admission waiting from campaign computation wall
 budgets while continuing its durable database/health heartbeat. Monotonic timestamps
 are comparable only within the same operating-system clock domain.
 
+Optional `run --receipt-file PATH` adds durable cleanup retry for that command.
+The existing parent directory must be owned by the command user and mode 0700;
+the receipt and invocation lock are mode 0600. Use one persistent path per serial
+command, outside any web-served directory. The file contains the coordinator URL,
+request ID and opaque lease ID, never the bearer token or child command. The lock
+is held for the entire invocation and prevents a second invocation sharing it.
+
+The client fsyncs `not_started` before it can submit a request, then
+`may_have_started` before spawning. Only after the entire owned process group is
+confirmed gone does it write `stopped`. A confirmed terminal server response
+removes the receipt. On the next invocation, `not_started` and `stopped` can retry
+exact-request cleanup safely, including a lost grant or release response.
+`may_have_started` never permits automatic cancellation: it requires an already
+terminal server record or explicit operator resolution after proving the original
+work stopped. Unknown/pruned records for that uncertain phase fail closed too.
+Crashes between physical completion and its durable acknowledgement therefore
+remain conservative, and no receipt can prove completion of escaped descendants.
+
+For the mounted Nextcloud data directory, a suitable future opt-in is
+`--receipt-file /var/ncdata/.memory-coordinator/nextcloud-cron.json`, with its parent
+created mode 0700 and owned by UID 33. This path is outside `/var/www/html` and
+persists container recreation. Adding the flag to the existing cron loop requires
+its separately coordinated restart; installing this client alone does not enable
+receipts or restart any service. Existing invocations continue without receipts.
+
 `cron_loop.py` accepts the same URL/token/job/peak/run/wait options plus `--interval 300` and the command after `--`. It runs one admitted job at a time and waits the interval **after completion**. Queue waits cannot accumulate multiple cron children. It intentionally replaces a separate scheduler for that one command; do not run both it and the original cron scheduler simultaneously.
 
 ## Recovery and operational limits
@@ -159,7 +188,8 @@ A five-second maintenance tick observes health and advances the same locked stat
 machine independently of requests. This lets clients use short queue attempts
 without perpetually resetting the stable-health window. Startup still requires
 60 seconds of observed health; a long observation gap resets it. Jobs wait only
-up to their explicit queue deadline; a dead active owner requires operator
+up to their explicit queue deadline while polling; abandoned never-granted
+requests expire after the owner timeout. A dead active owner requires operator
 resolution. Consider an alert for an orphan or unusually old queue head using
 existing monitoring.
 

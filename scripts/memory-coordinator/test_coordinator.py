@@ -65,6 +65,9 @@ class AdmissionTests(unittest.TestCase):
         for _ in range(int(seconds / 5)):
             self.clock.advance(5)
             self.engine.tick()
+            # Simulate real queued clients continuing their per-request polls.
+            for key in list(self.engine.state["queue"]):
+                self.engine.get(key)
 
     def grant(self):
         self.request()
@@ -106,7 +109,8 @@ class AdmissionTests(unittest.TestCase):
                 clock.advance(seconds)
                 self.steps += 1
         maintain(self.engine, threading.Lock(), StopAfterWindow())
-        self.assertEqual(self.request(wait_timeout_s=5)["state"], "granted")
+        self.assertEqual(self.request(wait_timeout_s=5)["state"], "queued")
+        self.assertEqual(self.engine.get("request-a")["state"], "granted")
 
     def test_swap_burst_resets_stable_window_and_unknown_blocks(self):
         self.request()
@@ -159,6 +163,8 @@ class AdmissionTests(unittest.TestCase):
         self.assertIsNone(self.engine.state["active"])
         self.health.available = 4096
         self.engine.tick()
+        self.assertIsNone(self.engine.state["active"])
+        self.engine.get("request-a")
         self.assertEqual(self.engine.state["active"], "request-a")
 
     def test_one_slot_then_release_admits_next(self):
@@ -172,8 +178,8 @@ class AdmissionTests(unittest.TestCase):
         first = self.grant()
         self.request("request-b")
         self.clock.advance(31)
-        self.assertEqual(self.engine.get("request-a")["state"], "blocked_orphan")
         self.assertEqual(self.engine.get("request-b")["state"], "queued")
+        self.assertEqual(self.engine.get("request-a")["state"], "blocked_orphan")
         self.health.pressure = 2
         self.assertEqual(self.engine.heartbeat("request-a", {"lease_id": first["lease_id"]})["state"], "granted")
 
@@ -239,7 +245,7 @@ class AdmissionTests(unittest.TestCase):
         self.store.fail = True
         self.clock.advance(5)
         with self.assertRaises(OSError):
-            self.engine.tick()
+            self.engine.get("request-a")
         self.store.fail = False
         with self.assertRaises(APIError) as ctx:
             self.engine.get("request-a")
@@ -345,6 +351,9 @@ class HTTPTests(unittest.TestCase):
                         request_id=f"request-{i}", job="test", peak_mib=1024, run_timeout_s=60))
                 with ThreadPoolExecutor(max_workers=8) as pool:
                     results = list(pool.map(submit, range(8)))
+                self.assertTrue(all(r["state"] == "queued" for r in results))
+                with ThreadPoolExecutor(max_workers=8) as pool:
+                    results = list(pool.map(lambda r: Client(url, token_file).call("GET", "/v1/requests/" + r["request_id"]), results))
                 self.assertEqual(sum(r["state"] == "granted" for r in results), 1)
                 self.assertEqual(sum(r["state"] == "queued" for r in results), 7)
                 active = next(r for r in results if r["state"] == "granted")
@@ -442,6 +451,8 @@ class FileBridgeTests(unittest.TestCase):
                 client = Client(directory.as_uri(), token_file, timeout=2)
                 with patch("client.urllib.request.build_opener", side_effect=AssertionError("network forbidden")):
                     first = client.call("POST", "/v1/requests", dict(request_id="request-a", job="fixture", peak_mib=1024, run_timeout_s=60))
+                    self.assertEqual(first["state"], "queued")
+                    first = client.call("GET", "/v1/requests/request-a")
                     second = client.call("POST", "/v1/requests", dict(request_id="request-b", job="fixture", peak_mib=1024, run_timeout_s=60))
                     self.assertEqual(first["state"], "granted")
                     self.assertEqual(second["state"], "queued")

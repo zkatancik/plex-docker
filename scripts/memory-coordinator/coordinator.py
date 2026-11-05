@@ -124,12 +124,18 @@ class Coordinator:
         self.config = {"healthy_seconds": 60, "max_peak_mib": 3072, "guest_reserve_mib": 512,
                        "max_swap_mib_s": 1,
                        "max_queue": 32, "lease_timeout_s": 30, "heartbeat_interval_s": 5,
+                       "queued_owner_timeout_s": 30,
                        "max_wait_s": 86400, "max_run_s": 86400, **(config or {})}
+        number(self.config["queued_owner_timeout_s"], "queued_owner_timeout_s", 5, 300)
         self.healthy_since = None
         self.last_tick = None
         self.failed = False
         self.state = store.load()
         self._validate_state()
+        # Queue polling is deliberately volatile. After restart, live clients
+        # have a fresh bounded grace to poll; persisted queue entries alone never
+        # prove an owner is present and can never acquire the active slot.
+        self.queue_last_seen = {key: self.clock() for key in self.state["queue"]}
         if self.state["active"]:
             request = self.state["requests"][self.state["active"]]
             request.update(state="blocked_orphan", reason="coordinator restarted; owner heartbeat required")
@@ -156,6 +162,9 @@ class Coordinator:
                 raise ValueError("invalid stored admission budget or deadline")
             if value["state"] == "queued" and not isinstance(value["guest"], bool):
                 raise ValueError("invalid stored guest flag")
+            if value["state"] == "queued" and (value.get("lease_id") or any(
+                    field in value for field in ("granted_at", "run_deadline", "last_heartbeat"))):
+                raise ValueError("queued request contains previous active ownership")
         active = s.get("active")
         live = [k for k, v in s["requests"].items() if v.get("state") in {"granted", "blocked_orphan"}]
         if live != ([active] if active else []):
@@ -188,7 +197,7 @@ class Coordinator:
         return {**request, "heartbeat_interval_s": self.config["heartbeat_interval_s"],
                 "lease_timeout_s": self.config["lease_timeout_s"]}
 
-    def tick(self):
+    def tick(self, owner_poll=None):
         if self.failed:
             raise APIError(503, "durable state failed; restart and inspect before admitting work")
         now, changed = self.clock(), False
@@ -206,9 +215,14 @@ class Coordinator:
             self.healthy_since = None
         for key in list(self.state["queue"]):
             item = self._request(key)
-            if now >= item["queue_deadline"]:
-                item.update(state="expired", reason="queue deadline reached", finished_at=now)
+            last_seen = self.queue_last_seen[key]
+            if now < last_seen:
+                self.queue_last_seen[key] = last_seen = now
+            if now >= item["queue_deadline"] or now - last_seen >= self.config["queued_owner_timeout_s"]:
+                reason = "queue deadline reached" if now >= item["queue_deadline"] else "queued owner stopped polling before work was granted"
+                item.update(state="expired", reason=reason, finished_at=now)
                 self.state["queue"].remove(key)
+                self.queue_last_seen.pop(key, None)
                 changed = True
         active = self.state["active"]
         if active:
@@ -236,12 +250,15 @@ class Coordinator:
                 reason = "guest available-memory probe unavailable"
             elif item["guest"] and health["guest_available_mib"] < item["peak_mib"] + self.config["guest_reserve_mib"]:
                 reason = "guest available memory below declared peak plus reserve"
+            elif owner_poll != item["request_id"]:
+                reason = "waiting for the queued owner's current poll"
             else:
                 reason = None
             if reason:
                 item["reason"] = reason
             else:
                 self.state["queue"].pop(0)
+                self.queue_last_seen.pop(item["request_id"], None)
                 self.state["active"] = item["request_id"]
                 item.update(state="granted", reason=None, lease_id=secrets.token_hex(24),
                             granted_at=now, last_heartbeat=now, run_deadline=now + item["run_timeout_s"])
@@ -276,12 +293,16 @@ class Coordinator:
                 "lease_id": None, "reason": "queued behind earlier work"}
         self.state["requests"][request_id] = item
         self.state["queue"].append(request_id)
+        self.queue_last_seen[request_id] = now
         self._save()
         self.tick()
         return self._view(item)
 
     def get(self, request_id):
-        self.tick()
+        item = self._request(request_id)
+        if item["state"] == "queued":
+            self.queue_last_seen[request_id] = self.clock()
+        self.tick(owner_poll=request_id)
         return self._view(self._request(request_id))
 
     def heartbeat(self, request_id, body):
@@ -318,6 +339,7 @@ class Coordinator:
             self.state["active"] = None
         elif item["state"] == "queued" and cancel:
             self.state["queue"].remove(request_id)
+            self.queue_last_seen.pop(request_id, None)
         else:
             raise APIError(409, "only an active lease can be released")
         item.update(state="cancelled" if cancel else "released", finished_at=self.clock(), reason=None)
