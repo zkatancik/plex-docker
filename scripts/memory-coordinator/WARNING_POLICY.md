@@ -3,11 +3,15 @@
 The implementation defaults both policy switches to false. This host enabled
 `warning_enabled=true` on 2026-11-05 after the initial 70-test review, then
 activated `capacity_bypass_enabled=true` with a two-completion/120-second bound
-and the non-granting queued-heartbeat endpoint at 23:19:16 UTC. The final
-coordinator suite passed 87 overlapping tests. Runtime configuration retains
+and the non-granting queued-heartbeat endpoint at 23:19:16 UTC. On November 5
+at 21:01 Chicago time, the host enabled `warning_burst_cooldown_s=60` after a
+gap-free trace and 126 passing coordinator tests. Runtime configuration retains
 max peak 4096 MiB, guest reserve 512 MiB, and the original normal-pressure gate.
 The private rollout receipt preserves code/config/state provenance. Actual job
-completion is still required to qualify the added route for this workload mix.
+completion is required to qualify the added route for this workload mix. Both
+Fantasy providers have completed ordinary refreshes and publications. After the
+cooldown activation, the guide-processor deployment and provider import also
+completed and physically released. Longer-run peak/throughput limits remain.
 
 ## Reason for a conditional route
 
@@ -45,7 +49,11 @@ window thresholds. The warning route is opt-in and requires:
   reads cannot manufacture history. Intervals below one second are invalid;
   a hard sample-count bound also protects the small in-memory deque.
 - Time-weighted rolling swap reads at most 0.5 MiB/s and writes at most
-  0.1 MiB/s. Any interval over 2 MiB/s reads or 1 MiB/s writes discards the window.
+  0.1 MiB/s. With this host's explicit cooldown, any interval over 2 MiB/s reads
+  or 1 MiB/s writes blocks new warning grants for 60 observed seconds. All burst
+  traffic remains in the complete rolling mean; later bursts restart the
+  cooldown. An absent/zero cooldown configuration retains the original rule
+  that discards the window. This does not raise either average threshold.
 - No active/invalid maintenance fence, critical/unknown pressure, missing/reset
   counters, stale readings, or unobserved gap. These clear warning readiness.
 - A Docker job's declared peak plus the existing 512 MiB reserve must fit a
