@@ -45,7 +45,7 @@ CUSTOM_HFR_REGEX = r"\b(?:48|50|59[ .]?94|60|120)[ ._-]?fps\b"
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".m4v", ".avi", ".ts"}
 HDR_TRANSFERS = {"smpte2084", "arib-std-b67"}
 HDR_PRIMARIES = {"bt2020"}
-RETRYABLE_STATUSES = {"blocked", "error", "interrupted", "encoding"}
+RETRYABLE_STATUSES = {"blocked", "error", "interrupted", "encoding", "capacity_deferred"}
 # quality_rejected is deliberately not retryable: the source failed the quality
 # gate at the bitrate ceiling, so re-encoding again can never succeed.
 ENCODED_POLL_STATUSES = {"normalized", "would_normalize"}
@@ -90,6 +90,14 @@ DEFAULT_PATH_MAPPINGS = [
 
 class NormalizerError(RuntimeError):
     """Base error for expected worker failures."""
+
+
+class TransientMediaProcessError(NormalizerError):
+    """Admission or process interruption is not evidence of damaged media."""
+
+    def __init__(self, message: str, *, status: str) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 class SafetyError(NormalizerError):
@@ -509,9 +517,14 @@ def run_bounded_ffmpeg(
                 raise ValueError("out of bounds")
         except ValueError as exc:
             raise NormalizerError("invalid media memory admission budget") from exc
+        # One persistent receipt/lock spans all serial probes and encodes. The
+        # installer prepares this private parent; the client rejects unsafe/missing
+        # ownership or permissions rather than silently repairing them here.
+        receipt = Path.home() / ".config" / "media-normalizer" / "memory-admission.json"
         bounded = [sys.executable, str(client), "--url", endpoint, "--token-file", str(token),
                    "run", "--job", "native-media-normalizer", "--peak-mib", str(peak),
-                   "--run-timeout", str(runtime), "--wait-timeout", str(wait), "--native", "--", *bounded]
+                   "--run-timeout", str(runtime), "--wait-timeout", str(wait),
+                   "--receipt-file", str(receipt), "--native", "--", *bounded]
         wall_timeout = wait + runtime + 60  # Admission wait does not consume encode time.
 
     process = None
@@ -554,6 +567,20 @@ def run_bounded_ffmpeg(
     result = subprocess.CompletedProcess(list(command), process.returncode,
         b"".join(tails[0]).decode("utf-8", errors="replace"),
         b"".join(tails[1]).decode("utf-8", errors="replace"))
+    # The admission CLI shares its exit-code channel with the child. Reserved
+    # wrapper results are therefore conservatively retryable, even if a child
+    # theoretically returned the same value. Never turn that ambiguity into a
+    # permanent media-quality verdict. Unwrapped ordinary decoder codes retain
+    # their existing interpretation, and check=False only suppresses decoder errors.
+    if wrapped and result.returncode == 75:
+        raise TransientMediaProcessError(
+            "media memory admission deferred (exit 75)", status="capacity_deferred"
+        )
+    if result.returncode < 0 or (wrapped and result.returncode in {124, 130, 137, 143}):
+        raise TransientMediaProcessError(
+            "media process interrupted or admission lease ended (exit %d)" % result.returncode,
+            status="interrupted",
+        )
     if check and result.returncode != 0:
         raise NormalizerError("command exited %d (ffmpeg): %s" % (
             result.returncode, (result.stderr or result.stdout).strip()[-4000:]))
@@ -1573,7 +1600,17 @@ def normalize_one(
     clients: Optional[Dict[str, ArrClient]] = None,
 ) -> Dict[str, Any]:
     path = path.resolve()
-    report = inspect_path(path, settings)
+    try:
+        report = inspect_path(path, settings)
+    except (TransientMediaProcessError, KeyboardInterrupt, SystemExit) as exc:
+        # Inspection precedes rollback/encoding. Persist retryability here too,
+        # including direct normalize/season calls that do not use process_poll_item.
+        if not dry_run:
+            status = exc.status if isinstance(exc, TransientMediaProcessError) else "interrupted"
+            deferred = {"decision": "inspection_deferred", "file_identity": current_file_identity(path)}
+            state["files"][str(path)] = record_for(deferred, status, error=str(exc))
+            atomic_write_json(settings.state_path, state)
+        raise
     result: Dict[str, Any] = {"path": str(path), "inspection": report}
     if report["decision"] != "normalize":
         result["status"] = report["decision"]
@@ -1694,6 +1731,8 @@ def normalize_one(
     except BaseException as exc:
         if isinstance(exc, (KeyboardInterrupt, SystemExit)):
             status = "interrupted"
+        elif isinstance(exc, TransientMediaProcessError):
+            status = exc.status
         elif isinstance(exc, QualityGateError):
             status = "quality_rejected"
         else:
@@ -1876,7 +1915,9 @@ def process_poll_item(
         log("%s result: %s %s" % (source, result["status"], item.path), settings)
         return result["status"], False
     except (NormalizerError, OSError) as exc:
-        if isinstance(exc, QualityGateError):
+        if isinstance(exc, TransientMediaProcessError):
+            status = exc.status
+        elif isinstance(exc, QualityGateError):
             status = "quality_rejected"
         elif isinstance(exc, SafetyError):
             status = "blocked"
