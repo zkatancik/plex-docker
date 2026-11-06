@@ -78,9 +78,17 @@ older fitting job merely by polling faster. Only the selected owner's current
 GET can acquire the single global lease; submission/status/background ticks
 still cannot grant.
 
-When the queue head cannot fit the current route/capacity, at most two later
-jobs may complete ahead of it. After those confirmed completions, reserve
-120 seconds without younger grants for the old job to become eligible. If it fits,
+When the oldest policy-eligible job lacks capacity, at most two later jobs
+may complete ahead of it. During warning mode with bypass enabled, native
+profiles are excluded only from the candidate-selection view: their actual
+queue positions, creation times, deadlines and normal-mode priority remain
+unchanged. They neither reserve guest capacity nor accrue new bypass debt.
+The oldest guest remains the fairness head, so a large guest behind a native
+request retains its own two-completion/120-second opportunity. Normal-mode
+selection and disabled-bypass strict FIFO remain unchanged.
+
+After those confirmed completions, reserve 120 seconds without younger grants
+for the eligible old job to gain capacity. If it fits,
 its owner can claim immediately. If it still cannot fit after that bounded
 pause, fitting work resumes and a new bounded cycle begins; its age is retained.
 This is a count/quiet-opportunity bound, not a wall-time promise: active jobs

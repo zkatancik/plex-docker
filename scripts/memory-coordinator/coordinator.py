@@ -338,7 +338,23 @@ class Coordinator:
         return None
 
     def _candidate(self, health, mono, mode):
-        head = self._request(self.state["queue"][0])
+        candidates = self.state["queue"]
+        if mode == "warning" and self.config["capacity_bypass_enabled"]:
+            # Native profiles cannot become eligible by reserving guest memory.
+            # Keep their durable FIFO positions for normal admission, and apply
+            # capacity fairness to the oldest currently eligible guest instead.
+            candidates = []
+            for key in self.state["queue"]:
+                item = self._request(key)
+                if item["guest"]:
+                    candidates.append(key)
+                else:
+                    item["reason"] = self._capacity_reason(item, health, mono, mode)
+                    self.capacity_reservation.pop(key, None)
+            if not candidates:
+                head = self._request(self.state["queue"][0])
+                return head, head["reason"], None
+        head = self._request(candidates[0])
         reason = self._capacity_reason(head, health, mono, mode)
         if reason is None:
             self.capacity_reservation.pop(head["request_id"], None)
@@ -354,7 +370,7 @@ class Coordinator:
             head["last_capacity_deferred_at"] = self.clock()
             head["reason"] = "capacity_deferred: oldest job still does not fit; original queue age retained"
             self._save()
-        for key in self.state["queue"][1:]:
+        for key in candidates[1:]:
             item = self._request(key)
             if self._capacity_reason(item, health, mono, mode) is None:
                 return item, None, head["request_id"]

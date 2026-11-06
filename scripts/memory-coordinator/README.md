@@ -43,13 +43,30 @@ On 2026-11-05 at 23:19:16 UTC, this host activated capacity fairness
 `capacity_reservation_s=120`) and the non-granting queued-heartbeat endpoint.
 The oldest currently fitting owner receives priority; after two confirmed
 completed/stopped bypasses, a 120-second hold on younger grants gives the old
-head an opportunity. It can claim immediately if it fits; otherwise fitting
-work resumes after the hold.
+eligible head an opportunity. It can claim immediately if it fits; otherwise fitting
+work resumes after the hold. During warning admission, native profiles remain
+in their original queue positions for normal admission but do not reserve
+guest capacity or accumulate bypass debt. The oldest guest receives the
+capacity-fairness opportunity, even when a native request precedes it.
 Budgets, health gates,
 and one-slot ownership remain unchanged. This does not guarantee admission for
 a workload that never fits, or retain age across abandoned/new request UUIDs.
 See [WARNING_POLICY.md](WARNING_POLICY.md) for sources, exact behavior,
 qualification limits and the request-age limitation across client retries.
+
+## Warning-mode fairness correction
+
+At 2026-11-06T03:49:36.991602+00:00 the host activated coordinator `7961f238faa5f8b9d8446e8d04d150cb36f6be24ddb595795b7745c691a8adaa`.
+The oldest policy-eligible guest is now the warning-mode fairness head; native
+requests retain normal-mode priority without imposing futile warning-mode
+reservations. This includes the mixed native → large guest → small guest case.
+131 controller/client/persistence tests and 17 inert activation fixtures passed,
+with independent source and activation review. The reload changed only the
+coordinator source at a verified idle boundary, preserving configuration and
+state without a maintenance fence. The EPG request retained age/deadline;
+Nextcloud's unstarted transport-interrupted request cancelled and follows its
+ordinary five-minute retry, so physical request age is not claimed preserved.
+The new process must collect fresh health evidence before warning admission.
 
 ## Dated deployment evidence
 
