@@ -10,6 +10,11 @@ def finite(value):
 class WarningWindow:
     def __init__(self, config):
         self.config = config
+        self.burst_cooldown = config.get("warning_burst_cooldown_s", 0)
+        if (not finite(self.burst_cooldown)
+                or self.burst_cooldown != 0 and not 60 <= self.burst_cooldown <= 300):
+            raise ValueError("warning_burst_cooldown_s must be 0 or 60..300")
+        self.last_burst_end = None
         self.intervals = deque()
         self.last_call = self.last_sample = None
         self.ready = False
@@ -24,6 +29,7 @@ class WarningWindow:
         self.last_reset = {"reason": reason, "previous_sample_mono": self.last_sample,
                            **self.observation}
         self.intervals.clear()
+        self.last_burst_end = None
         self.last_sample = None
         self.ready = False
         self.reason = reason
@@ -65,10 +71,15 @@ class WarningWindow:
         if self.last_sample is not None and (
                 not 0 < end - self.last_sample <= gap_limit or abs(end - self.last_sample - duration) > 0.25):
             self.reset("warning_counter_interval_gap")
-        if incoming > self.config["warning_burst_read_mib_s"] or outgoing > self.config["warning_burst_write_mib_s"]:
-            self.reset("warning_swap_burst")
-            self.last_sample = end
-            return
+        burst = incoming > self.config["warning_burst_read_mib_s"] or outgoing > self.config["warning_burst_write_mib_s"]
+        if burst:
+            if self.burst_cooldown == 0:
+                self.reset("warning_swap_burst")
+                self.last_sample = end
+                return
+            # A recent burst blocks new admission. Its complete measured traffic
+            # remains in the rolling mean; it is not deleted or replaced by zero.
+            self.last_burst_end = end
         if self.last_sample is None:
             # Pressure before this observation is unknown. Do not credit its
             # preceding counter interval after startup, critical, or a gap.
@@ -97,10 +108,16 @@ class WarningWindow:
         mean_write = write_total / observed
         full = observed >= self.config["warning_seconds"] - 0.001
         quiet = mean_read <= self.config["warning_mean_read_mib_s"] and mean_write <= self.config["warning_mean_write_mib_s"]
-        self.ready = full and quiet
-        self.reason = "warning_ready" if self.ready else "warning_health_wait" if not full else "warning_swap_average"
+        cooldown_remaining = (max(0.0, self.last_burst_end + self.burst_cooldown - end)
+                              if self.last_burst_end is not None else 0.0)
+        self.ready = full and quiet and cooldown_remaining == 0
+        self.reason = ("warning_ready" if self.ready else "warning_health_wait" if not full
+                       else "warning_swap_average" if not quiet else "warning_burst_cooldown")
         self.summary = {"observed_seconds": round(observed, 3), "mean_read_mib_s": mean_read,
                         "mean_write_mib_s": mean_write, "interval_count": len(self.intervals)}
+        if self.burst_cooldown:
+            self.summary.update(last_burst_end_mono=self.last_burst_end,
+                                burst_cooldown_remaining_s=cooldown_remaining)
 
     def view(self):
         return {"ready": self.ready, "reason": self.reason, **self.summary,

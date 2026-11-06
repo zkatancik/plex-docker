@@ -19,12 +19,24 @@ This service coordinates participating heavy jobs. It does not execute commands,
 `warning_enabled` defaults to false; this host explicitly enabled it on
 2026-11-05 after review. At current pressure 2, it can admit a Docker job after
 five continuously observed quiet minutes containing only pressure 1 or 2:
-rolling swap reads <=0.5 MiB/s, writes <=0.1 MiB/s, with interval bursts over
-2/1 MiB/s resetting the window. Critical/unknown pressure, maintenance,
+rolling swap reads <=0.5 MiB/s, writes <=0.1 MiB/s. This host enabled
+`warning_burst_cooldown_s=60` on November 5 at 21:01 Chicago time. An interval
+burst over 2/1 MiB/s now delays new warning grants for 60 observed seconds;
+all of its traffic remains in the complete five-minute rolling mean. A later
+burst restarts that cooldown. The default absent/zero setting retains the old
+full-window reset behavior. Critical/unknown pressure, maintenance,
 missing/reset counters and observation gaps still deny new work. The first
 valid observation anchors the window without crediting earlier time. Guest
 availability must still cover the truthful declared peak plus 512 MiB.
 Native work remains on the original normal-pressure route.
+
+The opt-in change passed 126 tests. A gap-free seven-minute trace supplied 82
+complete host intervals: equal-history replay yielded eight health-ready points
+with the cooldown versus one with the old reset rule. Neither replay is a
+workload completion or a long-run safety guarantee. The activation preserved
+the stopped-boundary queue/state and other configuration; one client that hit
+the brief reload reconciled its never-started receipt and resumed the same
+logical obligation. No memory allowance or mean-rate threshold was raised.
 
 On 2026-11-05 at 23:19:16 UTC, this host activated capacity fairness
 (`capacity_bypass_enabled=true`, `capacity_max_bypasses=2`,
