@@ -1,3 +1,4 @@
+#include "terminal-state.h"
 #import <Cocoa/Cocoa.h>
 #import <ApplicationServices/ApplicationServices.h>
 #import <Security/Security.h>
@@ -144,7 +145,7 @@ static NSDictionary *processSnapshot(pid_t mainPID, NSString *bundle) {
         if (proc_pidpath(pid,buf,sizeof(buf)) <= 0 || !args || b.pbi_uid != getuid())
             return @{@"ok": @NO, @"reason": @"descendant_identity_unknown"};
         all[@(pid)] = @{@"ppid": @(b.pbi_ppid), @"start": @(b.pbi_start_tvsec * 1000000ULL + b.pbi_start_tvusec),
-            @"path": @(buf), @"argv": args, @"children": @(count), @"sleeping": @(b.pbi_status == SSLEEP),
+            @"path": @(buf), @"argv": args, @"children": @(count), @"bsd_status": @(b.pbi_status),
             @"foreground_tty": @((b.pbi_flags & PROC_FLAG_CTTY) && b.e_tdev != UINT32_MAX && b.e_tpgid == b.pbi_pgid)};
     }
     NSMutableArray *unknown = [NSMutableArray array], *signature = [NSMutableArray array], *terminals = [NSMutableArray array];
@@ -179,8 +180,8 @@ static NSDictionary *processSnapshot(pid_t mainPID, NSString *bundle) {
             if ([kind isEqual:@"signed_computer_use"]) ok = signedBundle([NSHomeDirectory() stringByAppendingPathComponent:@".codex/computer-use/Codex Computer Use.app"],@"com.openai.sky.CUAService");
             if ([kind isEqual:@"terminal_candidate"]) {
                 struct proc_taskinfo task;
-                ok = [item[@"children"] integerValue] == 0 && [item[@"sleeping"] boolValue] && [item[@"foreground_tty"] boolValue] &&
-                    proc_pidinfo(pid.intValue,PROC_PIDTASKINFO,0,&task,sizeof(task)) == sizeof(task);
+                ok = [item[@"children"] integerValue] == 0 && [item[@"foreground_tty"] boolValue] &&
+                    CMMTerminalWaitingSnapshot(pid.intValue, [item[@"start"] unsignedLongLongValue], &task, proc_pidinfo);
                 if (ok) {
                     NSNumber *cpu = @(task.pti_total_user + task.pti_total_system);
                     [terminals addObject:@{@"identity": identity,@"cpu_ns": cpu}];

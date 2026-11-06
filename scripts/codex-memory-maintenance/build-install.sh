@@ -9,6 +9,8 @@ mkdir -p "$build_dir"
   "$source_dir/main.m" "$source_dir/policy.m" "$source_dir/vendor-hosts.m" -o "$build_dir/CodexMemoryMaintenance"
 /usr/bin/clang -fobjc-arc -O2 -Wall -Wextra -Werror -framework Foundation \
   "$source_dir/tests.m" "$source_dir/policy.m" -o "$build_dir/tests"
+/usr/bin/clang -O2 -Wall -Wextra -Werror "$source_dir/terminal-state-tests.c" -o "$build_dir/terminal-state-tests"
+"$build_dir/terminal-state-tests"
 "$build_dir/tests"
 /usr/bin/clang -fobjc-arc -O2 -Wall -Wextra -Werror -framework Foundation -framework Security \
   "$source_dir/vendor-hosts-tests.m" -o "$build_dir/vendor-tests"

@@ -24,7 +24,7 @@ The census recognizes the exact app-server command shape, the signed argument-fr
 
 The app's persistent temporary kernel/trusted-worker scripts are allowed only when their exact bytes occur in the current signed bundled `node_repl` binary, with the exact expected arguments and parent chain under a qualified CUA host. Nested app-servers require the exact signed binary and `app-server --listen stdio://` invocation. Comparison is bounded and streamed; it does not load a binary into RAM. All descendants are still inspected, so external commands launched by these hosts veto maintenance.
 
-A direct `/bin/zsh` with only a plain interactive/login invocation can qualify if it has a foreground controlling TTY, is sleeping, has no descendants, and has unchanged CPU counters and PID/start identity across a full 15-minute sequence of checks. Any command argument, script, child, CPU increase, sample gap, or clock/boot change resets or blocks this qualification. Restarting can discard these parked terminal sessions and shell state. Sleeping is not proof that a shell is displaying a prompt; waiting shell builtins remain a best-effort limitation.
+A direct `/bin/zsh` with only a plain interactive/login invocation can qualify if it has a foreground controlling TTY, has a complete stable thread census in `TH_STATE_WAITING`, has no descendants, and has unchanged CPU counters and PID/start identity across a full 15-minute sequence of checks. Any command argument, script, child, CPU increase, sample gap, or clock/boot change resets or blocks this qualification. Restarting can discard these parked terminal sessions and shell state. Sleeping is not proof that a shell is displaying a prompt; waiting shell builtins remain a best-effort limitation.
 
 ## Normal quit, identity, and recovery
 
@@ -48,7 +48,7 @@ A race remains between the last check and normal quit, especially when no warnin
 
 ## Build and one-time permission
 
-`bash build-install.sh --build-only` compiles with warnings as errors and runs 86 policy/recovery/dialog/process checks plus 14 vendor-origin checks. The latter safely inspect current signed binaries and temporary vendor script bytes; they never execute those scripts or an AX action. `--install` prepares a fresh disabled installation and refuses to overwrite an existing one. It never loads launchd, requests TCC permission, or quits Codex.
+`bash build-install.sh --build-only` compiles with warnings as errors and runs 86 policy/recovery/dialog/process checks,19 terminal-thread checks, plus14 vendor-origin checks. The latter safely inspect current signed binaries and temporary vendor script bytes; they never execute those scripts or an AX action. `--install` prepares a fresh disabled installation and refuses to overwrite an existing one. It never loads launchd, requests TCC permission, or quits Codex.
 
 Installed files are:
 
@@ -71,3 +71,9 @@ After review and permission, the operator may atomically set `enabled: true` in 
 To disable new maintenance, set `enabled: false`; leave the agent running if it owns an unresolved quit so it can restore the app. To stop all watcher activity, boot out only `gui/$(id -u)/com.zack.codex-memory-maintenance`, first confirming no pending quit needs recovery. Never delete a pending receipt to make it retry blindly. State/history expose silent deferral, recovery, and failure reasons without full arguments, environment variables, or chat content.
 
 Research and source evidence: `/Users/zack/Documents/Codex/2026-11-03/can-yo/work/codex-restart-policy-research.md`. Official guidance recommends finishing active chats before restart; local automations need the app running: [troubleshooting](https://learn.chatgpt.com/docs/reference/troubleshooting), [automations](https://learn.chatgpt.com/docs/automations), [app-server API](https://learn.chatgpt.com/docs/app-server). The descendant enumeration uses [Apple's libproc implementation](https://github.com/apple-oss-distributions/xnu/blob/main/libsyscall/wrappers/libproc/libproc.c).
+
+## Staged parked-terminal correction, November6
+
+A read-only check found that the two idle integrated shells report BSD process status2 (`SRUN`) even while their single Mach thread is waiting, with no runnable threads. Requiring `proc_bsdinfo.pbi_status == SSLEEP` therefore vetoed them indefinitely. The staged correction reads `PROC_PIDLISTTHREADS` and each `PROC_PIDTHREADINFO.pth_run_state`, requiring every thread to be `TH_STATE_WAITING`. Thread list/count, zero runnable count, process start identity and CPU counters must remain unchanged across the bounded read; incomplete/unknown, stopped, uninterruptible or running states still veto. Exact plain-shell arguments, direct parent, foreground TTY, no children and the existing15-minute unchanged-CPU history remain required. This is a wait-state correction, not permission to interrupt shell commands.
+
+This follows [Apple ps thread-state accounting](https://github.com/apple-oss-distributions/adv_cmds/blob/main/ps/tasks.c#L29-L45), the [XNU libproc dispatch](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/proc_info.c#L2310-L2334), and the installed macOS SDK's `proc_threadinfo`/`TH_STATE_WAITING` definitions. No app quit or Accessibility prompt was performed during the read-only proof.
