@@ -2,6 +2,7 @@
 import copy
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 from unittest.mock import Mock, patch
 
@@ -13,6 +14,27 @@ from test_coordinator import Clock, Health, MemoryStore
 class CleanupStatusTests(unittest.TestCase):
     def client(self):
         return Client('http://fixture.invalid', '/fixture-token-never-read')
+
+    def test_cancellation_during_wait_cannot_poll_claim_before_failed_cleanup(self):
+        clock = Clock()
+        engine = Coordinator(MemoryStore(), Health(), {'healthy_seconds': 0},
+                             clock=clock, monotonic_clock=clock)
+        class CancelDuringWait(threading.Event):
+            def wait(self, _timeout=None):
+                self.set()
+                return True
+        cancelled = CancelDuringWait()
+        client, calls = self.client(), []
+        def call(method, path, body=None):
+            calls.append((method, path))
+            if path.endswith('/cancel'):
+                raise AdmissionError('synthetic cleanup transport failure')
+            return dispatch(engine, method, path, body)
+        client.call = call
+        with self.assertRaises(AdmissionError):
+            client.acquire('fixture', 128, 100, cancel=cancelled)
+        self.assertIsNone(engine.state['active'], 'cancelled waiter still claimed a lease')
+        self.assertFalse(any(method == 'GET' for method, _path in calls))
 
     def test_transport_failure_during_cancel_cannot_grant_ready_queued_request(self):
         clock = Clock()

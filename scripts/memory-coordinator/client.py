@@ -175,6 +175,8 @@ class Client:
                     cancel.wait(2)
                 else:
                     time.sleep(2)
+                if cancel is not None and cancel.is_set():
+                    raise AdmissionError("admission wait cancelled")
                 result = self.call("GET", endpoint)
         except BaseException:
             try:
