@@ -145,6 +145,7 @@ if [ -n "${MEMORY_COORDINATOR_URL:-}" ] && [ "${TRAILER_MEMORY_SLOT_HELD:-0}" !=
         --url "$MEMORY_COORDINATOR_URL" \
         --token-file "${MEMORY_COORDINATOR_TOKEN_FILE:-/run/secrets/memory-coordinator-token}" \
         run --job trailer-processing --peak-mib 1024 --run-timeout 1800 --wait-timeout 86400 \
+        --receipt-file /app/config/.memory-coordinator/trailer-processing.json \
         -- env TRAILER_MEMORY_SLOT_HELD=1 sh "$0" "$@"
 fi
 
