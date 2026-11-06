@@ -16,6 +16,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from warning_policy import WarningWindow, finite
+from persistence_recovery import StateFile, StateOwnership, PersistenceConflict, encode
 
 
 class APIError(Exception):
@@ -27,32 +28,6 @@ def number(value, name, minimum, maximum):
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not minimum <= value <= maximum:
         raise APIError(400, f"invalid {name}")
     return value
-
-
-class StateFile:
-    def __init__(self, path):
-        self.path = pathlib.Path(path)
-
-    def load(self):
-        return json.loads(self.path.read_text())  # Corruption deliberately prevents startup.
-
-    def save(self, state):
-        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        fd, name = tempfile.mkstemp(prefix=".admission-", dir=self.path.parent)
-        try:
-            with os.fdopen(fd, "w") as stream:
-                json.dump(state, stream, separators=(",", ":"), allow_nan=False)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(name, self.path)
-            directory = os.open(self.path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
-        finally:
-            if os.path.exists(name):
-                os.unlink(name)
 
 
 class HealthProbe:
@@ -151,6 +126,10 @@ class Coordinator:
         self.healthy_since = None
         self.last_tick = None
         self.failed = False
+        self.failed_snapshot = None
+        self.recovery_blocked = None
+        self.recovery_next = None
+        self.recovery_attempts = 0
         self.state = store.load()
         self._validate_state()
         # Queue polling is deliberately volatile. After restart, live clients
@@ -207,11 +186,58 @@ class Coordinator:
             del self.state["requests"][item["request_id"]]
         try:
             self.store.save(self.state)
-        except Exception:
+        except Exception as error:
             self.failed = True
+            self.healthy_since = self.last_tick = None
+            self.warning_window.reset("persistence_failure")
+            try:
+                self._validate_state()
+                self.failed_snapshot = encode(self.state)
+            except Exception:
+                self.recovery_blocked = "invalid_frozen_state"
+            if isinstance(error, PersistenceConflict):
+                self.recovery_blocked = "state_ownership_conflict"
+            now = self.monotonic_clock()
+            self.recovery_next = now + 30 if finite(now) else None
             raise
 
+    def retry_persistence(self):
+        """Maintenance-only, under the engine lock; never observes or grants work."""
+        if not self.failed or self.recovery_blocked is not None:
+            return False
+        now = self.monotonic_clock()
+        if not finite(now):
+            self.recovery_next = None
+            return False
+        if self.recovery_next is None or now < self.recovery_next - 30:
+            self.recovery_next = now + 30
+            return False
+        if now < self.recovery_next:
+            return False
+        self.recovery_next = now + 30
+        self.recovery_attempts += 1
+        try:
+            self._validate_state()
+            if self.failed_snapshot is None or encode(self.state) != self.failed_snapshot:
+                raise PersistenceConflict("frozen state changed")
+            self.store.retry_frozen(self.failed_snapshot)
+        except (PersistenceConflict, ValueError, TypeError):
+            self.recovery_blocked = "state_ownership_conflict"
+            return False
+        except Exception:
+            return False  # Transient I/O failure: same state, bounded later retry.
+        self.failed = False
+        self.failed_snapshot = None
+        self.recovery_next = None
+        self.healthy_since = self.last_tick = None
+        self.warning_window.reset("persistence_recovered")
+        # No new deadline, queue age, presence, lease or grace period is invented.
+        # A subsequent ordinary tick processes overdue ownership before a claim.
+        return True
+
     def _request(self, request_id):
+        if self.failed:
+            raise APIError(503, "durable state unavailable; retain owned cleanup identity")
         try:
             return self.state["requests"][request_id]
         except KeyError:
@@ -223,7 +249,7 @@ class Coordinator:
 
     def tick(self, owner_poll=None):
         if self.failed:
-            raise APIError(503, "durable state failed; restart and inspect before admitting work")
+            raise APIError(503, "durable state unavailable; retain owned cleanup identity")
         now, mono, changed = self.clock(), self.monotonic_clock(), False
         if self.last_tick is None or now - self.last_tick > 10 or now < self.last_tick:
             self.healthy_since = None
@@ -473,7 +499,10 @@ def maintain(engine, lock, stop):
     while not stop.is_set():
         try:
             with lock:
-                engine.tick()
+                if engine.failed:
+                    engine.retry_persistence()
+                else:
+                    engine.tick()
         except Exception:
             pass  # Probe/state failures block grants; ownership is never discarded.
         stop.wait(5)
@@ -531,10 +560,10 @@ def handler_class(engine, token, lock=None):
 def exclusive_state_lock(path):
     path = pathlib.Path(str(path) + ".lock")
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        yield
+        yield StateOwnership(pathlib.Path(str(path)[:-5]), fd)
     finally:
         os.close(fd)
 
@@ -548,13 +577,13 @@ def main():
     token = pathlib.Path(config["token_file"]).read_text().strip()
     if len(token) < 32 or any(c.isspace() for c in token):
         raise ValueError("token file must contain one strong token of at least 32 characters")
-    with exclusive_state_lock(config["state_file"]):
+    with exclusive_state_lock(config["state_file"]) as ownership:
         if args.initialize_state:
             if pathlib.Path(config["state_file"]).exists():
                 raise ValueError("refusing to overwrite existing state")
-            StateFile(config["state_file"]).save({"version": 1, "requests": {}, "queue": [], "active": None})
+            StateFile(config["state_file"], ownership=ownership).save({"version": 1, "requests": {}, "queue": [], "active": None})
             return
-        engine = Coordinator(StateFile(config["state_file"]), HealthProbe(config), config)
+        engine = Coordinator(StateFile(config["state_file"], ownership=ownership), HealthProbe(config), config)
         lock = threading.Lock()
         server = ThreadingHTTPServer((config.get("listen_host", "127.0.0.1"), config.get("port", 8766)), handler_class(engine, token, lock))
         server.daemon_threads = True

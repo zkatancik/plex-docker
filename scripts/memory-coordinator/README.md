@@ -100,7 +100,7 @@ That command refuses to overwrite existing state and exits without serving. Norm
 python3 coordinator.py --config /absolute/private/directory/config.json
 ```
 
-Do not put `--initialize-state` in a service definition. Missing/corrupt state prevents normal startup. A filesystem lock prevents two coordinators using the same state path. Changes are written via atomic rename, file and directory fsync, and mode 0600. A runtime state-write failure poisons admission until restart; a later GET cannot accidentally expose an unpersisted grant. Do not delete/reset/restore old state while jobs might still be running.
+Do not put `--initialize-state` in a service definition. Missing/corrupt state prevents normal startup. A filesystem lock prevents two coordinators using the same state path. Changes are written via atomic rename, file and directory fsync, and mode 0600. A runtime state-write failure freezes admission and the exact failed in-memory state; a later GET cannot expose an unpersisted grant. The guarded maintenance retry described below can recover transient storage failures without restarting or discarding ownership. Do not delete/reset/restore old state while jobs might still be running.
 
 No daemon or production integration is installed by these source files or tests.
 
@@ -244,6 +244,29 @@ opt-in for other invocations; installing client source alone enables no service.
 `cron_loop.py` accepts the same URL/token/job/peak/run/wait options plus `--interval 300` and the command after `--`. It runs one admitted job at a time and waits the interval **after completion**. Queue waits cannot accumulate multiple cron children. It intentionally replaces a separate scheduler for that one command; do not run both it and the original cron scheduler simultaneously.
 
 ## Recovery and operational limits
+
+The persistence-recovery source added on 2026-11-06 has not yet been activated
+on this host. Installation requires `persistence_recovery.py` beside the
+coordinator and the existing owned-fence/no-active-lease deployment procedure.
+
+On a state-write failure, the coordinator freezes the complete validated state
+and denies API mutations, including owner-presence refresh. The maintenance
+loop retries those same bytes at most once every 30 monotonic seconds under
+the existing engine lock. It verifies the original private directory and
+lifetime lock, plus exact known or attempted state-file identity and contents.
+It clears the failure only after file fsync, atomic replacement, directory
+fsync, and confirmation of that exact new file. Recovery resets health history
+and never grants, extends a deadline, invents an owner, or frees an orphan.
+Elapsed queue and lease deadlines are processed on the next ordinary tick.
+
+Repeated I/O failures retain the snapshot for later retry. Unknown state
+replacement, unsafe permissions, altered frozen memory, or lost lock identity
+remain blocked for explicit reconciliation. Do not restart a failed daemon
+merely to clear this latch: newer ownership may exist only in its frozen RAM.
+Startup still refuses missing or corrupt state; a failed startup write exits.
+The 114-test source suite includes queue/grant/release write faults before and
+after replacement, chained retry failures, external changes, and ownership
+and health-window preservation. These are fault fixtures, not live workloads.
 
 Ordinary heartbeats update the live in-memory timestamp, while ownership,
 deadline and lifecycle transitions remain durable. This avoids repeatedly
