@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>MEDIA_NORMALIZER_MEMORY_CLIENT_FILE</key>
+		<string>/Users/zack/.config/home-memory-coordinator/client.py</string>
+		<key>MEDIA_NORMALIZER_MEMORY_COORDINATOR_URL</key>
+		<string>http://127.0.0.1:8766</string>
+		<key>MEDIA_NORMALIZER_MEMORY_PEAK_MIB</key>
+		<string>1536</string>
+		<key>MEDIA_NORMALIZER_MEMORY_TOKEN_FILE</key>
+		<string>/Users/zack/.config/home-memory-coordinator/token</string>
+		<key>MEDIA_NORMALIZER_MEMORY_WAIT_SECONDS</key>
+		<string>60</string>
+	</dict>
+	<key>Label</key>
+	<string>com.zkatancik.plex-media-normalizer-retry</string>
+	<key>LowPriorityIO</key>
+	<true/>
+	<key>Nice</key>
+	<integer>10</integer>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/bin/python3</string>
+		<string>/Users/zack/plex-docker/scripts/media-normalizer.py</string>
+		<string>retry-deferred</string>
+	</array>
+	<key>StandardErrorPath</key>
+	<string>/Users/zack/plex-docker/media-normalizer/launchd-error.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/zack/plex-docker/media-normalizer/launchd.log</string>
+	<key>ThrottleInterval</key>
+	<integer>60</integer>
+	<key>WorkingDirectory</key>
+	<string>/Users/zack/plex-docker</string>
+	<key>StartInterval</key>
+	<integer>900</integer>
+	<key>RunAtLoad</key>
+	<true/>
+</dict>
+</plist>

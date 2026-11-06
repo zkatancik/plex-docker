@@ -374,8 +374,8 @@ class StateAndLoggingTests(unittest.TestCase):
             command = launch.call_args.args[0]
             self.assertIn("--native", command)
             self.assertEqual(command[command.index("--run-timeout") + 1], "180")
-            self.assertEqual(command[command.index("--wait-timeout") + 1], "900")
-            process.wait.assert_called_once_with(timeout=1140)
+            self.assertEqual(command[command.index("--wait-timeout") + 1], "60")
+            process.wait.assert_called_once_with(timeout=300)
 
     def test_ffmpeg_missing_admission_credentials_fails_closed(self):
         with mock.patch.dict(os.environ, {"MEDIA_NORMALIZER_MEMORY_COORDINATOR_URL": "http://127.0.0.1:8766",

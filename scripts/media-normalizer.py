@@ -46,6 +46,8 @@ VIDEO_EXTENSIONS = {".mkv", ".mp4", ".m4v", ".avi", ".ts"}
 HDR_TRANSFERS = {"smpte2084", "arib-std-b67"}
 HDR_PRIMARIES = {"bt2020"}
 RETRYABLE_STATUSES = {"blocked", "error", "interrupted", "encoding", "capacity_deferred"}
+ADMISSION_RETRY_STATUSES = {"capacity_deferred", "interrupted"}
+MAX_LOCKED_ADMISSION_WAIT_SECONDS = 60
 # quality_rejected is deliberately not retryable: the source failed the quality
 # gate at the bitrate ceiling, so re-encoding again can never succeed.
 ENCODED_POLL_STATUSES = {"normalized", "would_normalize"}
@@ -318,6 +320,13 @@ def valid_state(value: Any) -> bool:
         and isinstance(value.get("watermarks"), dict)
         and isinstance(value.get("files"), dict)
         and isinstance(value.get("rollbacks"), list)
+        and ("pending_poll" not in value or (
+            isinstance(value["pending_poll"], dict)
+            and value["pending_poll"].get("version") == 1
+            and isinstance(value["pending_poll"].get("completed"), dict)
+            and all(isinstance(key, str) and isinstance(identity, str)
+                    for key, identity in value["pending_poll"]["completed"].items())
+        ))
     )
 
 
@@ -511,10 +520,13 @@ def run_bounded_ffmpeg(
             raise NormalizerError("media memory admission requires client and token files")
         try:
             peak = int(os.environ.get("MEDIA_NORMALIZER_MEMORY_PEAK_MIB", "1536"))
-            wait = int(os.environ.get("MEDIA_NORMALIZER_MEMORY_WAIT_SECONDS", "86400"))
+            wait = int(os.environ.get("MEDIA_NORMALIZER_MEMORY_WAIT_SECONDS", "60"))
             runtime = int(math.ceil(timeout if timeout is not None else 7200))
             if not 1 <= peak <= 3072 or not 1 <= wait <= 86400 or not 1 <= runtime <= 86400:
                 raise ValueError("out of bounds")
+            # The library mutation lock spans this transaction. Never park it
+            # for a day while waiting for admission; the durable poll is retried.
+            wait = min(wait, MAX_LOCKED_ADMISSION_WAIT_SECONDS)
         except ValueError as exc:
             raise NormalizerError("invalid media memory admission budget") from exc
         # One persistent receipt/lock spans all serial probes and encodes. The
@@ -1036,6 +1048,8 @@ def sample_decode(path: Path, probe: Dict[str, Any], ffmpeg: str) -> List[Dict[s
                 "error": result.stderr.strip()[-1000:] if result.returncode else "",
             }
         )
+        if result.returncode:
+            break  # A definite decoder failure already rules out replacement.
     return results
 
 
@@ -1842,6 +1856,15 @@ def current_file_identity(path: Path) -> Optional[str]:
     return "%d:%d:%d" % (stat.st_dev, stat.st_ino, stat.st_size)
 
 
+def current_file_stamp(path: Path) -> Optional[str]:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return "%d:%d:%d:%d:%d" % (
+        stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+
 def mark_automatic(state: Dict[str, Any], item: ManagedMedia) -> None:
     record = state["files"].setdefault(str(item.path), {})
     record["automatic"] = True
@@ -1936,7 +1959,9 @@ def process_poll_item(
         )
         if not dry_run:
             atomic_write_json(settings.state_path, state)
-        log("%s failed for %s: %s" % (source, item.path, exc), settings, stderr=True)
+        deferred = isinstance(exc, TransientMediaProcessError)
+        log("%s %s for %s: %s" % (source, "deferred" if deferred else "failed", item.path, exc),
+            settings, stderr=not deferred)
         return record["status"], True
 
 
@@ -1963,11 +1988,33 @@ def run_poll(settings: Settings, *, dry_run: bool) -> int:
         state["watermarks"],
         cycle,
     )
+    completed = state.get("pending_poll", {}).get("completed", {})
+    def already_completed(item: ManagedMedia) -> bool:
+        identity = current_file_stamp(item.path)
+        return identity is not None and completed.get(str(item.path)) == identity
+    priority = [item for item in priority if not already_completed(item)]
+    unseen = [item for item in unseen if not already_completed(item)]
+    if not dry_run:
+        # Retain the entire unfinished poll, including not-yet-visited imports.
+        # Completion and its watermark are committed together below.
+        state["pending_poll"] = {"version": 1, "completed": completed}
+        atomic_write_json(settings.state_path, state)
+    def checkpoint(item: ManagedMedia, before_stamp: Optional[str]) -> None:
+        if not dry_run:
+            stamp = current_file_stamp(item.path)
+            result_identity = state["files"].get(str(item.path), {}).get("file_identity")
+            if (stamp is not None and stamp == before_stamp
+                    and ":".join(stamp.split(":")[:3]) == result_identity):
+                completed[str(item.path)] = stamp
+            else:
+                completed.pop(str(item.path), None)
+            atomic_write_json(settings.state_path, state)
     backfill: List[ManagedMedia] = []
     inspected = 0
     backfill_encoded = 0
     failures = 0
     for item in priority:
+        before_stamp = current_file_stamp(item.path)
         _status, failed = process_poll_item(
             item,
             settings,
@@ -1977,6 +2024,9 @@ def run_poll(settings: Settings, *, dry_run: bool) -> int:
             source="poll",
         )
         failures += int(failed)
+        if _status in ADMISSION_RETRY_STATUSES:
+            return 75
+        checkpoint(item, before_stamp)
 
     for item in unseen:
         if inspected >= settings.backfill_inspect_limit:
@@ -1985,6 +2035,7 @@ def run_poll(settings: Settings, *, dry_run: bool) -> int:
             break
         inspected += 1
         backfill.append(item)
+        before_stamp = current_file_stamp(item.path)
         status, failed = process_poll_item(
             item,
             settings,
@@ -1994,12 +2045,16 @@ def run_poll(settings: Settings, *, dry_run: bool) -> int:
             source="backfill",
         )
         failures += int(failed)
+        if status in ADMISSION_RETRY_STATUSES:
+            return 75
+        checkpoint(item, before_stamp)
         if status in ENCODED_POLL_STATUSES:
             backfill_encoded += 1
 
     if not dry_run:
         state["watermarks"] = {service: isoformat(cycle) for service in clients}
         removed = cleanup_rollbacks(state, settings)
+        state.pop("pending_poll", None)
         atomic_write_json(settings.state_path, state)
         if removed:
             log(
@@ -2013,6 +2068,13 @@ def run_poll(settings: Settings, *, dry_run: bool) -> int:
         settings,
     )
     return 1 if failures else 0
+
+
+def deferred_poll_pending(state: Dict[str, Any]) -> bool:
+    return "pending_poll" in state or any(
+        record.get("status") in ADMISSION_RETRY_STATUSES and record.get("automatic", True)
+        for record in state["files"].values() if isinstance(record, dict)
+    )
 
 
 def run_normalize_path(settings: Settings, path: Path, *, dry_run: bool) -> int:
@@ -2030,7 +2092,7 @@ def run_normalize_path(settings: Settings, path: Path, *, dry_run: bool) -> int:
         )
     except (NormalizerError, OSError) as exc:
         log("normalize failed for %s: %s" % (path, exc), settings, stderr=True)
-        return 1
+        return 75 if isinstance(exc, TransientMediaProcessError) else 1
     if not dry_run:
         atomic_write_json(settings.state_path, state)
     print(json.dumps(result, indent=2, sort_keys=True))
@@ -2062,6 +2124,10 @@ def run_normalize_season(
             if not dry_run:
                 mark_automatic(state, item)
             log("season failed for %s: %s" % (item.path, exc), settings, stderr=True)
+            if isinstance(exc, TransientMediaProcessError):
+                if not dry_run:
+                    atomic_write_json(settings.state_path, state)
+                return 75
     if not dry_run:
         atomic_write_json(settings.state_path, state)
     log("season complete: %d file(s), %d failure(s)" % (len(files), failures), settings)
@@ -2120,6 +2186,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="process new Arr imports, then backfill older unrecorded incompatible media",
     )
     poll.add_argument("--dry-run", action="store_true", help="report without changing state or media")
+    subparsers.add_parser("retry-deferred", help="resume an unfinished automatic poll; otherwise do nothing")
     normalize = subparsers.add_parser("normalize", help="explicitly normalize existing media")
     selection = normalize.add_mutually_exclusive_group(required=True)
     selection.add_argument("--path", type=Path)
@@ -2142,6 +2209,13 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
     settings = load_settings()
     try:
         with process_lock(settings.lock_path):
+            if args.command == "retry-deferred":
+                if not deferred_poll_pending(load_state(settings.state_path)):
+                    return 0
+                if not os.environ.get("MEDIA_NORMALIZER_MEMORY_COORDINATOR_URL"):
+                    raise SafetyError("automatic deferred retry requires memory admission")
+                with media_mutation_lock(settings.media_mutation_lock_path):
+                    return run_poll(settings, dry_run=False)
             if args.command == "audit":
                 return run_audit(settings, json_output=args.json)
             if args.command == "sync-policy":
