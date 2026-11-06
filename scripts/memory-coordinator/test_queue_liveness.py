@@ -114,7 +114,8 @@ class AcquisitionCleanupTests(unittest.TestCase):
             try:
                 result = dispatch(engine, method, path, body)
             except APIError as error:
-                raise AdmissionError("HTTP " + str(error.status)) from None
+                raise AdmissionError("HTTP " + str(error.status), status=error.status,
+                                     server_error=error.message) from None
             if method == "GET" and result["state"] == "granted" and not dropped:
                 dropped = True
                 raise AdmissionError("synthetic lost grant response")

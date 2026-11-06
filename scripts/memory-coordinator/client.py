@@ -118,19 +118,40 @@ class Client:
 
     def cancel_unstarted(self, request_id, info=None):
         """Only before work starts, or with a durable receipt proving it stopped."""
+        if info is not None and info.get("phase") == "may_have_started":
+            raise AdmissionError("Uncertain workload cannot be cancelled as unstarted")
         endpoint = "/v1/requests/" + request_id
         try:
             # Queued cancellation needs no lease. Do this before GET, which is
             # the owner's polling/claim operation and may grant a live queue head.
-            return self.call("POST", endpoint + "/cancel",
-                             {"lease_id": (info or {}).get("lease_id"), "stopped": True})
+            result = self.call("POST", endpoint + "/cancel",
+                               {"lease_id": (info or {}).get("lease_id"), "stopped": True})
         except AdmissionError as error:
             if error.status == 404 and error.server_error == "unknown request":
                 return {"request_id": request_id, "state": "absent"}
-            # A lost grant response may require recovering this exact identity.
-            known = self.call("GET", endpoint)
-            return self.call("POST", endpoint + "/cancel",
-                             {"lease_id": known.get("lease_id"), "stopped": True})
+            if error.status != 409:
+                raise  # Transport/auth/server failures never justify a claim.
+            # Only an explicit lease conflict can conceal a raced/lost grant.
+            # The caller's never-started/stopped proof authorizes reconciliation.
+            try:
+                known = self.call("GET", endpoint)
+            except AdmissionError as lookup_error:
+                if lookup_error.status == 404 and lookup_error.server_error == "unknown request":
+                    return {"request_id": request_id, "state": "absent"}
+                raise
+            if not isinstance(known, dict) or known.get("request_id") != request_id:
+                raise AdmissionError("Cleanup identity was not confirmed")
+            if known.get("state") in {"cancelled", "released", "expired"}:
+                return known
+            lease_id = known.get("lease_id")
+            if known.get("state") not in {"granted", "blocked_orphan"} or not isinstance(lease_id, str) or not lease_id:
+                raise AdmissionError("Cleanup lease was not confirmed")
+            result = self.call("POST", endpoint + "/cancel",
+                               {"lease_id": lease_id, "stopped": True})
+        if (not isinstance(result, dict) or result.get("request_id") != request_id
+                or result.get("state") not in {"cancelled", "released", "expired"}):
+            raise AdmissionError("Cleanup terminal identity was not confirmed")
+        return result
 
     def acquire(self, job, peak_mib, run_timeout_s, *, guest=True, wait_timeout_s=86400, cancel=None, request_id=None):
         request_id = request_id or str(uuid.uuid4())
@@ -213,7 +234,7 @@ class RunReceipt:
 
     def lock(self):
         try:
-            parent = self.path.parent.stat(follow_symlinks=False)
+            parent = self.path.parent.lstat()
             if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != os.geteuid() or parent.st_mode & 0o077:
                 raise AdmissionError("Lifecycle receipt directory must be private and owned by this user")
             self.lock_fd = os.open(str(self.path) + ".lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)

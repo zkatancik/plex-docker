@@ -77,6 +77,18 @@ class ReceiptTests(unittest.TestCase):
             RunReceipt(self.path.parent / "other.json").lock()
         os.chmod(self.path.parent, 0o700)
 
+    def test_receipt_parent_symlink_is_rejected_without_following_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            private = root / "private"
+            private.mkdir(mode=0o700)
+            link = root / "link"
+            link.symlink_to(private, target_is_directory=True)
+            receipt = RunReceipt(link / "receipt.json")
+            with self.assertRaises(AdmissionError):
+                receipt.lock()
+            self.assertFalse((private / "receipt.json.lock").exists())
+
     def test_invalid_fifo_and_duplicate_json_fail_closed(self):
         self.path.unlink()
         os.mkfifo(self.path, 0o600)

@@ -293,6 +293,7 @@ class Coordinator:
                 changed = True
         if changed:
             self._save()
+        return health
 
     def _capacity_reason(self, item, health, mono, mode):
         if item["peak_mib"] > self.config["max_peak_mib"]:
@@ -442,9 +443,9 @@ class Coordinator:
         return self._view(item)
 
     def status(self):
-        self.tick()
+        health = self.tick()
         return {"active": self.state["active"], "queue": list(self.state["queue"]),
-                "healthy_since": self.healthy_since, "health": self.health.get(),
+                "healthy_since": self.healthy_since, "health": health,
                 "warning_window": self.warning_window.view(),
                 "requests": [self._view(v) for v in self.state["requests"].values() if v["state"] not in self.TERMINAL]}
 

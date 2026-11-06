@@ -15,8 +15,14 @@ class WarningWindow:
         self.ready = False
         self.reason = "warning_health_wait"
         self.summary = {}
+        self.reset_count = 0
+        self.last_reset = None
+        self.observation = {}
 
     def reset(self, reason):
+        self.reset_count += 1
+        self.last_reset = {"reason": reason, "previous_sample_mono": self.last_sample,
+                           **self.observation}
         self.intervals.clear()
         self.last_sample = None
         self.ready = False
@@ -24,6 +30,13 @@ class WarningWindow:
         self.summary = {}
 
     def observe(self, health, now):
+        # Keep one bounded, numeric reset record. A healthy observation may
+        # replace the current reason, but must not erase the cause of a reset.
+        self.observation = {key: value if finite(value) else None for key, value in {
+            "observed_mono": now,
+            **{key: health.get(key) for key in ("host_observed_mono", "host_interval_seconds",
+                "swap_in_mib_s", "swap_out_mib_s", "pressure_level")}}.items()}
+        self.observation["maintenance_active"] = health.get("maintenance_active", False) is not False
         gap_limit = self.config["warning_max_probe_gap_s"]
         if not finite(now):
             self.reset("warning_clock_unknown")
@@ -90,4 +103,6 @@ class WarningWindow:
                         "mean_write_mib_s": mean_write, "interval_count": len(self.intervals)}
 
     def view(self):
-        return {"ready": self.ready, "reason": self.reason, **self.summary}
+        return {"ready": self.ready, "reason": self.reason, **self.summary,
+                "reset_count": self.reset_count,
+                "last_reset": dict(self.last_reset) if self.last_reset is not None else None}
