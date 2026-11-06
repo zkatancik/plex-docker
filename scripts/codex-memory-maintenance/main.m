@@ -507,6 +507,11 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
     if (state[@"pending_restart"]) {
         record(state,recoverRestart(cfg,state,dry),nil,dry); close(lock); return 0;
     }
+    // Pending recovery may relaunch without AX. Only new unattended attempts
+    // require permission; avoid history/vendor scans while that action is impossible.
+    if (!dry && !AXIsProcessTrusted()) {
+        record(state, @"accessibility_permission_required", nil, NO); close(lock); return 0;
+    }
     NSString *telemetry = [cfg[@"telemetry_directory"] stringByExpandingTildeInPath];
     struct stat telemetryStat;
     if (lstat(telemetry.fileSystemRepresentation, &telemetryStat) || !S_ISDIR(telemetryStat.st_mode) ||

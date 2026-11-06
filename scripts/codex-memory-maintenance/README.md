@@ -20,6 +20,8 @@ The prepared LaunchAgent runs every 60 seconds. New maintenance requires all of:
 
 The footprint is the collector's direct app-family physical footprint, including compressed charges, not RSS or all descendant memory. The native watcher uses the same raw monotonic clock as the shared collector. It reads `~/.config/home-memory-monitor/latest.json` and bounded daily history; it makes no network requests.
 
+For unattended `--run`, config/state validation and any already-owned restart recovery run first. If Accessibility is unavailable and no restart is pending, the helper records a silent permission deferral before loading monitor history or inspecting descendants/vendor signatures. This avoids repeated work when a new Quit is impossible. Explicit `--dry-run` retains full diagnostics. Pending relaunch recovery remains available without Accessibility, including when new maintenance is disabled. After a long permission gap, the existing terminal continuity rules require fresh observations; an unobserved interval does not count as quiet time.
+
 ## Known hosts and terminal qualification
 
 The census recognizes the exact app-server command shape, the signed argument-free code-mode host under that app-server, the app's remote exec host, signed Electron infrastructure, bundled `node_repl`, exact Codex app-tools and CUA plugin launch shapes, the signed computer-use service, and the exact installed artifact daemon layout. User-owned plugin/runtime scripts and parent directories must be regular, not symlinks, and not writable by others. Arbitrary Node programs are blocked.
@@ -50,7 +52,7 @@ A race remains between the last check and normal quit, especially when no warnin
 
 ## Build and one-time permission
 
-`bash build-install.sh --build-only` compiles with warnings as errors and runs 86 policy/recovery/dialog/process checks,19 terminal-thread checks, plus14 vendor-origin checks. The latter safely inspect current signed binaries and temporary vendor script bytes; they never execute those scripts or an AX action. `--install` prepares a fresh disabled installation and refuses to overwrite an existing one. It never loads launchd, requests TCC permission, or quits Codex.
+`bash build-install.sh --build-only` compiles with warnings as errors and runs 86 policy/recovery/dialog/process checks,19 terminal-thread checks,14 vendor-origin checks and17 actual-entrypoint routing checks. The vendor checks safely inspect current signed binaries and temporary vendor script bytes; they never execute those scripts or an AX action. The entrypoint fixtures use inert collaborators to verify permission deferral, pending launch/quit recovery without AX, disabled-but-pending recovery and complete dry-run diagnostics without touching production files. `--install` prepares a fresh disabled installation and refuses to overwrite an existing one. It never loads launchd, requests TCC permission, or quits Codex.
 
 Installed files are:
 

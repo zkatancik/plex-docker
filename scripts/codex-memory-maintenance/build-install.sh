@@ -15,6 +15,7 @@ mkdir -p "$build_dir"
 /usr/bin/clang -fobjc-arc -O2 -Wall -Wextra -Werror -framework Foundation -framework Security \
   "$source_dir/vendor-hosts-tests.m" -o "$build_dir/vendor-tests"
 "$build_dir/vendor-tests"
+/usr/bin/python3 -B "$source_dir/entrypoint-fixtures.py"
 if [[ "${1:---build-only}" == "--build-only" ]]; then exit 0; fi
 if [[ "${1:-}" != "--install" ]]; then echo 'Use --build-only or --install' >&2; exit 2; fi
 # Install only a fresh, reviewed identity. Never silently replace a TCC-approved binary/config.
