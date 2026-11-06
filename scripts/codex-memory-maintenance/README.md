@@ -4,12 +4,14 @@ A native, silent watcher for memory-triggered **normal Quit and relaunch**. It i
 
 **Server status at 2026-11-05 19:22:37 UTC:** the root task enabled the private policy and loaded the LaunchAgent after source review. The final installed executable SHA-256 is `fa3b41cfe9e2e9fbd05421795b3cd882ea836ccf60b51c11b204cbeb217ed8c3`. A one-time Accessibility request was made; permission was still pending. The app-age and active-tool gates also deferred maintenance. This source-only status update does not rebuild or alter the installed helper. The local activation receipt is `~/.config/codex-memory-maintenance/activation.json`.
 
+**Live policy update at 2026-11-06 00:31:15 UTC:** the minimum app uptime is now six hours, while the successful-restart cooldown remains 24 hours. This empirical trial allows the first idle cleanup before a full day has elapsed; the 4 GiB footprint, 15-minute sustained-pressure and user-idle requirements, activity checks, normal-Quit guard and recovery behavior are unchanged. Only that private configuration key changed; the executable was not rebuilt. The dry run was eligible on memory/age grounds and correctly vetoed active external work. Accessibility was still ungranted, and no restart occurred. Evidence: `work/rollout/liveness-runs/20261106T001419Z/codex-six-hour-minimum.json` in the memory-audit workspace.
+
 ## Policy
 
 The prepared LaunchAgent runs every 60 seconds. New maintenance requires all of:
 
 - Complete host-memory samples covering 15 minutes of warning/critical pressure and at least 4096 MiB direct Codex footprint.
-- One unchanged app PID/version during that window; app age at least 24 hours.
+- One unchanged app PID/version during that window; app age at least the configured minimum: six hours on this server, with a 24-hour installer default.
 - At least 15 minutes without user input; at least 24 hours since the last successful or recognized replacement.
 - Fresh samples and gaps no greater than 150 seconds, matching boot identity, wall time, and explicit `CLOCK_MONOTONIC_RAW` timestamps. Legacy/partial records block the window.
 - A complete, unchanged descendant census, with no unknown process or identifiable external work command.
