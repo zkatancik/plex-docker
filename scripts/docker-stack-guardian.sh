@@ -6,7 +6,7 @@ PATH="/usr/local/bin:/opt/homebrew/bin:/Users/zack/.homebrew/bin:/usr/sbin:/usr/
 DOCKER="/usr/local/bin/docker"
 LOG_DIR="${HOME}/Library/Logs/docker-stack-guardian"
 LOG_FILE="${LOG_DIR}/guardian.log"
-LOCK_DIR="${HOME}/Library/Caches/docker-stack-guardian.lock"
+LOCK_FILE="${HOME}/Library/Caches/docker-stack-guardian.flock"
 CONFIG_DIR="${HOME}/.config/docker-stack-guardian"
 DISABLED_FILE="${CONFIG_DIR}/disabled-stacks"
 
@@ -16,15 +16,16 @@ log() {
   echo "[$(/bin/date '+%Y-%m-%d %H:%M:%S')] $*" | /usr/bin/tee -a "${LOG_FILE}"
 }
 
-finish() {
-  /bin/rmdir "${LOCK_DIR}" >/dev/null 2>&1 || true
-}
-
-if ! /bin/mkdir "${LOCK_DIR}" 2>/dev/null; then
-  log "Another guardian run is active; exiting"
-  exit 0
+# Keep the inode in place. The kernel releases ownership when zsh exits.
+zmodload zsh/system || exit 1
+if ! : >>"${LOCK_FILE}"; then
+  log "Cannot open guardian lock"
+  exit 1
 fi
-trap finish EXIT INT TERM
+if ! zsystem flock -t 0 -f guardian_fd "${LOCK_FILE}"; then
+  log "Guardian lock unavailable; skipping this run"
+  exit 1
+fi
 
 if [[ ! -x "${DOCKER}" ]] || ! "${DOCKER}" info >/dev/null 2>&1; then
   log "Docker is not ready; the next scheduled run will retry"
