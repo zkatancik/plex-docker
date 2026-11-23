@@ -3,6 +3,7 @@
 import argparse
 import contextlib
 import fcntl
+import hashlib
 import hmac
 import json
 import math
@@ -10,6 +11,7 @@ import os
 import pathlib
 import re
 import secrets
+import stat
 import subprocess
 import tempfile
 import threading
@@ -59,6 +61,96 @@ class HealthProbe:
         except (OSError, ValueError, UnicodeError):
             return True
 
+    def _native_control_guard(self):
+        """Optional durable hold: presence blocks admission, with no TTL.
+
+        Only a valid private file yields an ownership digest/identity. Invalid
+        or unreadable presence remains a hold; no content (including a nonce)
+        is exposed through health. Unconfigured installations keep old policy.
+        """
+        configured = "native_control_guard_file" in self.config
+        path = self.config.get("native_control_guard_file")
+        result = {"native_control_guard_supported": True,
+                  "native_control_guard_file": path if isinstance(path, str) else None,
+                  "native_control_guard_active": configured,
+                  "native_control_guard_digest": None,
+                  "native_control_guard_identity": None}
+        if not configured:
+            return result
+        if not isinstance(path, str) or not path or not os.path.isabs(path):
+            return result
+        try:
+            before = os.lstat(path)
+        except FileNotFoundError:
+            result["native_control_guard_active"] = False
+            return result
+        except (OSError, ValueError, UnicodeError):
+            return result
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
+                or before.st_mode & 0o077 or before.st_size > 4096):
+            return result
+        descriptor = None
+        try:
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            opened = os.fstat(descriptor)
+            if (not stat.S_ISREG(opened.st_mode) or opened.st_uid != os.getuid()
+                    or opened.st_mode & 0o077 or opened.st_size > 4096
+                    or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)):
+                return result
+            raw = bytearray()
+            while len(raw) <= 4096:
+                chunk = os.read(descriptor, 4097 - len(raw))
+                if not chunk:
+                    break
+                raw.extend(chunk)
+            after = os.fstat(descriptor)
+            current = os.lstat(path)
+            identity = lambda info: (info.st_dev, info.st_ino, info.st_size,
+                                     info.st_mtime_ns, info.st_ctime_ns, info.st_mode, info.st_uid)
+            if len(raw) > 4096 or identity(opened) != identity(after) or identity(after) != identity(current):
+                return result
+
+            def unique_object(pairs):
+                value = {}
+                for key, item in pairs:
+                    if key in value:
+                        raise ValueError("duplicate guard field")
+                    value[key] = item
+                return value
+
+            def invalid_constant(_value):
+                raise ValueError("nonfinite guard value")
+
+            value = json.loads(bytes(raw).decode("utf-8"), object_pairs_hook=unique_object,
+                               parse_constant=invalid_constant)
+            required = {"version", "scope", "run_id", "manifest_sha256", "fence_identity"}
+            # Recovery metadata is digest-bound, never proof of execution,
+            # expiry or physical cleanup for admission.
+            optional = {"nonce", "job_label", "job_pgid", "job_start",
+                        "work_deadline_epoch", "work_deadline_raw", "work_deadline_clock", "run_directory", "boot_session_uuid"}
+            if (not isinstance(value, dict) or not required.issubset(value)
+                    or set(value) - required - optional
+                    or type(value["version"]) is not int or value["version"] != 1
+                    or value["scope"] != "synthetic-native-harness-control"
+                    or not isinstance(value["run_id"], str)
+                    or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value["run_id"]) is None
+                    or not isinstance(value["manifest_sha256"], str)
+                    or re.fullmatch(r"[a-f0-9]{64}", value["manifest_sha256"]) is None
+                    or not isinstance(value["fence_identity"], list) or len(value["fence_identity"]) != 2
+                    or any(type(item) is not int or item < 0 for item in value["fence_identity"])
+                    or value["fence_identity"][1] == 0
+                    or ("nonce" in value and (not isinstance(value["nonce"], str)
+                                              or not 1 <= len(value["nonce"]) <= 256))):
+                return result
+            result["native_control_guard_digest"] = hashlib.sha256(raw).hexdigest()
+            result["native_control_guard_identity"] = [after.st_dev, after.st_ino]
+            return result
+        except (OSError, ValueError, UnicodeError, TypeError, RecursionError):
+            return result
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
     def get(self):
         now, mono = self.clock(), self.monotonic_clock()
         if self.host_cache is None or mono - self.host_cache[0] >= 5 or mono < self.host_cache[0]:
@@ -93,7 +185,9 @@ class HealthProbe:
                 self.guest_cache = (mono, {"guest_available_mib": None, "guest_observed_mono": mono})
         # Check the maintenance fence on every admission read, independently of
         # cached pressure/guest probes, so a freshly written hold takes effect now.
-        return {**self.host_cache[1], **self.guest_cache[1], "maintenance_active": self._maintenance_active(now)}
+        guard = self._native_control_guard()
+        return {**self.host_cache[1], **self.guest_cache[1], **guard,
+                "maintenance_active": self._maintenance_active(now) or guard["native_control_guard_active"]}
 
 
 class Coordinator:
@@ -103,7 +197,7 @@ class Coordinator:
         self.store, self.health, self.clock = store, health, clock
         self.monotonic_clock = monotonic_clock
         self.config = {"healthy_seconds": 60, "max_peak_mib": 3072, "guest_reserve_mib": 512,
-                       "max_swap_mib_s": 1,
+                       "max_swap_mib_s": 1, "host_pressure_admission_enabled": True,
                        "max_queue": 32, "lease_timeout_s": 30, "heartbeat_interval_s": 5,
                        "queued_owner_timeout_s": 30,
                        "max_wait_s": 86400, "max_run_s": 86400,
@@ -113,7 +207,7 @@ class Coordinator:
                        "warning_max_probe_gap_s": 10, "capacity_bypass_enabled": False,
                        "capacity_max_bypasses": 2, "capacity_reservation_s": 120, **(config or {})}
         number(self.config["queued_owner_timeout_s"], "queued_owner_timeout_s", 5, 300)
-        for key in ("warning_enabled", "capacity_bypass_enabled"):
+        for key in ("warning_enabled", "capacity_bypass_enabled", "host_pressure_admission_enabled"):
             if type(self.config[key]) is not bool:
                 raise ValueError("invalid policy switch")
         for key, low, high in (("warning_seconds", 60, 3600), ("warning_mean_read_mib_s", 0, 1),
@@ -294,6 +388,8 @@ class Coordinator:
             mode = None
             if maintenance:
                 reason = "maintenance window active or maintenance file invalid/unreadable"
+            elif not self.config["host_pressure_admission_enabled"]:
+                mode, reason = "capacity_only", None
             elif self.healthy_since is not None and now - self.healthy_since >= self.config["healthy_seconds"]:
                 mode, reason = "normal", None
             elif health.get("pressure_level") == 2 and self.warning_window.ready:
@@ -330,7 +426,7 @@ class Coordinator:
             available = health.get("guest_available_mib")
             if not finite(available) or available < 0:
                 return "guest available-memory probe unavailable"
-            if mode == "warning" and (not finite(health.get("guest_observed_mono")) or
+            if mode in ("warning", "capacity_only") and (not finite(health.get("guest_observed_mono")) or
                     not 0 <= mono - health["guest_observed_mono"] <= 20):
                 return "guest available-memory probe unavailable or stale"
             if available < item["peak_mib"] + self.config["guest_reserve_mib"]:
@@ -488,6 +584,7 @@ class Coordinator:
         health = self.tick()
         return {"active": self.state["active"], "queue": list(self.state["queue"]),
                 "healthy_since": self.healthy_since, "health": health,
+                "host_pressure_admission_enabled": self.config["host_pressure_admission_enabled"],
                 "warning_window": self.warning_window.view(),
                 "requests": [self._view(v) for v in self.state["requests"].values() if v["state"] not in self.TERMINAL]}
 

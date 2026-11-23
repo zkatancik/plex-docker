@@ -359,6 +359,11 @@ services:
 
   # ─── Seerr (Requests UI) ────────────────────────────────────────────
   overseerr:
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
     image: overseerr:arr-availability
     build:
       # Same pinned Seerr fork, with accurate partial-season availability.
@@ -421,7 +426,7 @@ services:
       - /Users/zack/plex-docker/containers/agregarr/trailer-postprocessor.sh:/app/config/trailer-postprocessor.sh:ro
       - /Users/zack/.config/home-memory-coordinator/client.py:/opt/memory-coordinator/client.py:ro
       - /Users/zack/.config/home-memory-coordinator/token:/run/secrets/memory-coordinator-token:ro
-      - /Users/zack/plex-docker/agregarr/yt-dlp.conf:/etc/yt-dlp.conf:ro
+      - /Users/zack/plex-docker/containers/agregarr/yt-dlp.conf:/etc/yt-dlp.conf:ro
       - /Volumes/HomeLabPool/placeholders/movies:/data/movies
       - /Volumes/HomeLabPool/placeholders/tv:/data/tv
     ports:
@@ -446,6 +451,7 @@ services:
       - MEMORY_COORDINATOR_TOKEN_FILE=/run/secrets/memory-coordinator-token
     volumes:
       - /Users/zack/plex-docker/agregarr:/app/config
+      - /Users/zack/plex-docker/containers/agregarr/trailer-watcher.sh:/app/config/trailer-watcher.sh:ro
       - /Users/zack/plex-docker/containers/agregarr/trailer-postprocessor.sh:/app/config/trailer-postprocessor.sh:ro
       - /Users/zack/.config/home-memory-coordinator/client.py:/opt/memory-coordinator/client.py:ro
       - /Users/zack/.config/home-memory-coordinator/token:/run/secrets/memory-coordinator-token:ro

@@ -295,7 +295,10 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(bad.get(), {"pressure_level": None, "guest_available_mib": None,
                                     "swap_in_mib_s": None, "swap_out_mib_s": None,
                                     "maintenance_active": False, "host_observed_mono": self.clock(),
-                                    "host_interval_seconds": None, "guest_observed_mono": self.clock()})
+                                    "host_interval_seconds": None, "guest_observed_mono": self.clock(),
+                                    "native_control_guard_supported": True,
+                                    "native_control_guard_file": None, "native_control_guard_active": False,
+                                    "native_control_guard_digest": None, "native_control_guard_identity": None})
 
     def test_maintenance_file_ttl_missing_invalid_and_unreadable(self):
         with tempfile.TemporaryDirectory() as folder:

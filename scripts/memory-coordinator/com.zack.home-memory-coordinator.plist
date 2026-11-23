@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>com.zack.home-memory-coordinator</string>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/zack/.homebrew/bin/python3</string>
+		<string>/Users/zack/.config/home-memory-coordinator/coordinator.py</string>
+		<string>--config</string>
+		<string>/Users/zack/.config/home-memory-coordinator/config.json</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Users/zack/Library/Logs/home-memory-coordinator/stderr.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/zack/Library/Logs/home-memory-coordinator/stdout.log</string>
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+</dict>
+</plist>

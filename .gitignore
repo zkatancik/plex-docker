@@ -19,7 +19,26 @@ scripts/*
 !scripts/media-normalizer.py
 !scripts/qb-port-sync.py
 !scripts/plex-docker-recover.sh
+!scripts/docker_storage_location.py
+!scripts/startup_check_supervisor.py
+!scripts/daily-storage-maintenance.sh
+!scripts/ssd-storage-maintenance.py
+!scripts/request-protected-ssd-audit.py
+!scripts/protected-ssd-reader.py
+!scripts/torrent_restore_hardlinks.py
+!scripts/docker-settings-reader/
+scripts/docker-settings-reader/*
+!scripts/docker-settings-reader/main.swift
+!scripts/docker-settings-reader/build.sh
+!scripts/docker-settings-reader/Info.plist
+!scripts/docker-settings-reader/entitlements.plist
 !scripts/docker-stack-guardian.sh
+!scripts/home-memory-monitor/
+scripts/home-memory-monitor/*
+!scripts/home-memory-monitor/home-memory.plugin
+!scripts/home-memory-monitor/test_monitor.py
+!scripts/home-memory-monitor/README.md
+!scripts/home-memory-monitor/statsd-hook.zsh
 !scripts/codex-memory-maintenance/
 scripts/codex-memory-maintenance/*
 !scripts/codex-memory-maintenance/policy.h
@@ -34,6 +53,7 @@ scripts/codex-memory-maintenance/*
 !scripts/codex-memory-maintenance/config.example.json
 !scripts/memory-coordinator/
 scripts/memory-coordinator/*
+!scripts/memory-coordinator/com.zack.home-memory-coordinator.plist
 !scripts/memory-coordinator/warning_policy.py
 !scripts/memory-coordinator/test_warning_policy.py
 !scripts/memory-coordinator/test_capacity_bypass_review.py
@@ -66,3 +86,9 @@ recyclarr/configs/*
 # Never track local environment files
 .env
 .env.*
+
+.DS_Store
+
+!agregarr/
+agregarr/*
+!agregarr/trailer-audit.sh

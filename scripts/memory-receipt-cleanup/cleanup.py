@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 
 sys.dont_write_bytecode = True
 HOME = Path('/Users/zack')
@@ -85,7 +86,93 @@ def load_client(path):
     return module
 
 
-def reconcile(spec, module, client=None):
+def trailer_boot_proof(spec, receipt, module, *, locked, host_boot=None, client=None, boot_file=None):
+    """Observe the local owner on one Docker VM boot. Only that lease can be retired on another."""
+    directory = Path(spec['receipt']).parent
+    private_directory(directory)
+    if directory.stat().st_uid != os.geteuid():
+        return None
+    if not locked:
+        # RunReceipt.lock also rejects unsafe files. Witness only a checked
+        # lock file whose flock is held by another local invocation.
+        fd = os.open(str(receipt.path) + '.lock', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            module.RunReceipt._check_file(os.fstat(fd))
+            try:
+                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                return None
+            except BlockingIOError:
+                pass
+        finally:
+            os.close(fd)
+    value = receipt.read()
+    if (not value or value['phase'] != 'may_have_started' or value['url'] != spec['url']
+            or not value.get('lease_id')):
+        return None
+    if not host_boot:
+        return None
+    host_boot = str(uuid.UUID(host_boot))
+    boot = str(uuid.UUID(Path(boot_file or '/proc/sys/kernel/random/boot_id').read_text().strip()))
+    witness = directory / 'trailer-boot-proof.json'
+    binding = hashlib.sha256(json.dumps([value['url'], value['request_id'], value['lease_id']],
+                                         separators=(',', ':')).encode()).hexdigest()
+    previous = None
+    try:
+        fd = os.open(witness, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, 'rb') as stream:
+            module.RunReceipt._check_file(os.fstat(stream.fileno()))
+            raw = stream.read(513)
+        if len(raw) > 512:
+            raise ValueError('oversized witness')
+        previous = json.loads(raw)
+        uuid.UUID(previous['boot'])
+        uuid.UUID(previous['host_boot'])
+    except FileNotFoundError:
+        pass
+    if previous is None or previous['binding'] != binding:
+        # Only record a live grant, never adopt a different owner's file or lease.
+        client = client or module.Client(spec['url'], spec['token'], timeout=CALL_TIMEOUT)
+        status = client.call('GET', '/v1/status')
+        if not active_trailer(status, value, 'granted'):
+            return None
+        fd, temporary = tempfile.mkstemp(prefix='.trailer-boot-', dir=directory)
+        try:
+            with os.fdopen(fd, 'w') as f:
+                json.dump({'binding': binding, 'boot': boot, 'host_boot': host_boot}, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temporary, witness)
+            receipt._sync_directory()
+        finally:
+            Path(temporary).unlink(missing_ok=True)
+        return None
+    if not locked or previous['boot'] == boot or previous['host_boot'] == host_boot:
+        return None
+    client = client or module.Client(spec['url'], spec['token'], timeout=CALL_TIMEOUT)
+    status = client.call('GET', '/v1/status')
+    if not active_trailer(status, value, 'blocked_orphan'):
+        if not any(row.get('request_id') == value['request_id'] for row in status['requests']):
+            # A prior release response may have been lost. The receipt client's
+            # existing terminal-only path cannot claim a present queued request.
+            receipt.recover(client)
+            return {'outcome': 'acknowledged', 'phase': 'may_have_started'}
+        return None
+    result = client.call('POST', '/v1/requests/' + value['request_id'] + '/release',
+                         {'lease_id': value['lease_id'], 'stopped': True})
+    receipt.confirmed(result, value['request_id'])
+    receipt.clear()
+    return {'outcome': 'acknowledged', 'phase': 'may_have_started'}
+
+
+def active_trailer(status, value, state):
+    rows = [row for row in status.get('requests', [])
+            if row.get('request_id') == value['request_id']]
+    return (status.get('active') == value['request_id'] and len(rows) == 1
+            and rows[0].get('job') == 'trailer-processing' and rows[0].get('guest') is True
+            and rows[0].get('state') == state and rows[0].get('lease_id') == value['lease_id'])
+
+
+def reconcile(spec, module, client=None, host_boot=None):
     """No API operation until receipt ownership, phase and endpoint are proven."""
     if os.geteuid() != spec['uid']:
         return {'outcome': 'wrong_uid'}
@@ -100,6 +187,10 @@ def reconcile(spec, module, client=None):
         try:
             receipt.lock()
         except module.AdmissionError:
+            if spec == ROLES['trailer']:
+                # A busy/unsafe lock never authorizes release. The observer may
+                # retain only a credential-free witness of this exact live grant.
+                trailer_boot_proof(spec, receipt, module, locked=False, client=client, host_boot=host_boot)
             # The client intentionally shares one error for busy and unsafe locks.
             return {'outcome': 'busy_or_unsafe'}
         try:
@@ -108,6 +199,10 @@ def reconcile(spec, module, client=None):
             return {'outcome': 'invalid_receipt'}
         if value is None:
             return {'outcome': 'absent'}
+        if value['phase'] == 'may_have_started' and spec == ROLES['trailer']:
+            recovered = trailer_boot_proof(spec, receipt, module, locked=True, client=client, host_boot=host_boot)
+            if recovered:
+                return recovered
         if value['phase'] not in {'stopped', 'not_started'}:
             return {'outcome': 'uncertain_skipped', 'phase': value['phase']}
         if value['url'] != spec['url']:
@@ -125,7 +220,7 @@ def reconcile(spec, module, client=None):
         receipt.close()
 
 
-def helper(role):
+def helper(role, host_boot=None):
     spec = ROLES[role]
     try:
         with deadline(HELPER_SECONDS):
@@ -136,7 +231,7 @@ def helper(role):
                 Path(spec['receipt']).lstat()
             except FileNotFoundError:
                 return {'outcome': 'absent'}
-            return reconcile(spec, load_client(spec['client']))
+            return reconcile(spec, load_client(spec['client']), host_boot=host_boot)
     except Deadline:
         return {'outcome': 'deadline_retry_pending'}
     except UnreviewedClient:
@@ -180,8 +275,13 @@ def pass_role(role, source, runner=invoke):
                 return {'outcome': 'container_identity_unconfirmed'}
             if meta.get('running') is not True or meta.get('paused') is not False:
                 return {'outcome': 'container_unavailable'}
+            boot_args = []
+            if role == 'trailer':
+                host_boot = subprocess.check_output(['/usr/sbin/sysctl', '-n', 'kern.bootsessionuuid'],
+                                                    text=True, timeout=2).strip()
+                boot_args = ['--host-boot', str(uuid.UUID(host_boot))]
             result = runner([DOCKER, '--host', DOCKER_ENDPOINT, 'exec', '-i', '--user', str(spec['uid']), cid,
-                             spec['python'], '-I', '-', '--helper', role], stdin=source)
+                             spec['python'], '-I', '-', '--helper', role, *boot_args], stdin=source)
         if (not isinstance(result, dict) or set(result) - {'outcome', 'phase'}
                 or result.get('outcome') not in OUTCOMES
                 or ('phase' in result and result['phase'] not in {'not_started', 'stopped', 'may_have_started'})):
@@ -257,10 +357,11 @@ def run_pass(*, nextcloud=False, directory=STATUS_DIR):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--helper', choices=tuple(ROLES))
+    parser.add_argument('--host-boot')
     parser.add_argument('--nextcloud', action='store_true')
     args = parser.parse_args()
     if args.helper:
-        print(json.dumps(helper(args.helper)))
+        print(json.dumps(helper(args.helper, args.host_boot)))
         return 0
     return run_pass(nextcloud=args.nextcloud)
 

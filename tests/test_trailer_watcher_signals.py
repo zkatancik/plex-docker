@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import signal
 import subprocess
+import shutil
 import sys
 import tempfile
 import time
@@ -16,8 +17,12 @@ import os, pathlib, shutil, sys, time
 name = pathlib.Path(sys.argv[0]).name
 root = pathlib.Path(os.environ['WATCHER_FIXTURE'])
 if name == 'mktemp':
-    path = root / 'probe-source'
-    path.write_bytes(b'')
+    if '-d' in sys.argv:
+        path = root / 'watcher-work'
+        path.mkdir()
+    else:
+        path = root / 'probe-source'
+        path.write_bytes(b'')
     print(path)
 elif name == 'dd':
     target = next(a[3:] for a in sys.argv[1:] if a.startswith('of='))
@@ -52,7 +57,8 @@ class TrailerWatcherSignals(unittest.TestCase):
                 path = binary / command
                 path.write_text('#!' + sys.executable + '\n' + STUB)
                 path.chmod(0o755)
-            (binary / 'rm').symlink_to('/bin/rm')
+            for command in ('rm', 'rmdir', 'mkfifo'):
+                (binary / command).symlink_to(shutil.which(command))
             fixture_script = root / 'watcher.sh'
             source = SCRIPT.read_text()
             source = source.replace('MOVIES_DIR="/data/movies"', 'MOVIES_DIR="' + str(movies) + '"')

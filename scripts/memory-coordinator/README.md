@@ -87,6 +87,10 @@ infrastructure checks and smaller real warning-route completions do not qualify
 the largest forecast/research peaks or a full workload week. The earlier 9 GiB
 trial did not fit the 4096+512 MiB requirement at its dated capacity sample.
 
+## Deployed admission settings
+
+The Mac uses `host_pressure_admission_enabled: false`. Its coordinator still checks the maintenance fence, the native-control guard and fresh guest capacity for Docker jobs. The LaunchAgent reads the private configuration under `~/.config/home-memory-coordinator/`. The native-control guard path there is `native-control.guard.json`. Keep the token and live ownership state on the host.
+
 ## Configuration and first installation
 
 Example config contains no credential. Put real config/state/token outside repositories and restrict the containing directory to its owner:

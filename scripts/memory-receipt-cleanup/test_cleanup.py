@@ -14,7 +14,7 @@ HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location('receipt_cleanup', HERE / 'cleanup.py')
 c = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(c)
-client_module = c.load_client('/Users/zack/plex-docker/scripts/memory-coordinator/client.py')
+client_module = c.load_client(str(Path(__file__).resolve().parents[1] / 'memory-coordinator/client.py'))
 
 
 class FakeClient(client_module.Client):

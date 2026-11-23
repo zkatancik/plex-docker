@@ -1,12 +1,13 @@
 #!/bin/zsh
 set -u
+set -o pipefail
 
 PATH="/usr/local/bin:/opt/homebrew/bin:/Users/zack/.homebrew/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 DOCKER="/usr/local/bin/docker"
 LOG_DIR="${HOME}/Library/Logs/docker-stack-guardian"
 LOG_FILE="${LOG_DIR}/guardian.log"
-LOCK_DIR="${HOME}/Library/Caches/docker-stack-guardian.lock"
+LOCK_FILE="${HOME}/Library/Caches/docker-stack-guardian.flock"
 CONFIG_DIR="${HOME}/.config/docker-stack-guardian"
 DISABLED_FILE="${CONFIG_DIR}/disabled-stacks"
 MAINTENANCE_FILE="${CONFIG_DIR}/maintenance-until"
@@ -14,18 +15,38 @@ MAINTENANCE_FILE="${CONFIG_DIR}/maintenance-until"
 /bin/mkdir -p "${LOG_DIR}" "${HOME}/Library/Caches" "${CONFIG_DIR}"
 
 log() {
-  echo "[$(/bin/date '+%Y-%m-%d %H:%M:%S')] $*" | /usr/bin/tee -a "${LOG_FILE}"
+  local LC_ALL=C
+  local entry="[$(/bin/date '+%Y-%m-%d %H:%M:%S')] $*"
+  local current_size=0
+  # Bound a single diagnostic as well as the complete log. Keep one old file.
+  if (( ${#entry} > 8192 )); then
+    entry="${entry[1,8178]} [truncated]"
+  fi
+  if [[ -L "${LOG_FILE}" || -L "${LOG_FILE}.1" || -L "${LOG_FILE}.tmp" ]]; then
+    return 1
+  fi
+  if [[ -e "${LOG_FILE}" ]]; then
+    [[ -f "${LOG_FILE}" ]] || return 1
+    current_size="$(/usr/bin/stat -f %z "${LOG_FILE}")" || return 1
+  fi
+  if (( current_size + ${#entry} + 1 > 1048576 )); then
+    /usr/bin/tail -c 1048576 "${LOG_FILE}" >"${LOG_FILE}.tmp" &&
+      /bin/mv -f "${LOG_FILE}.tmp" "${LOG_FILE}.1" || return 1
+    : >"${LOG_FILE}"
+  fi
+  print -r -- "${entry}" >>"${LOG_FILE}"
 }
 
-finish() {
-  /bin/rmdir "${LOCK_DIR}" >/dev/null 2>&1 || true
-}
-
-if ! /bin/mkdir "${LOCK_DIR}" 2>/dev/null; then
-  log "Another guardian run is active; exiting"
-  exit 0
+# Keep the inode in place. The kernel releases ownership when zsh exits.
+zmodload zsh/system || exit 1
+if ! : >>"${LOCK_FILE}"; then
+  log "Cannot open guardian lock"
+  exit 1
 fi
-trap finish EXIT INT TERM
+if ! zsystem flock -t 0 -f guardian_fd "${LOCK_FILE}"; then
+  log "Guardian lock unavailable; skipping this run"
+  exit 1
+fi
 
 # A bounded maintenance window lets deliberate deploys/restarts finish without
 # the watchdog racing them. An abandoned window expires automatically.
@@ -35,6 +56,12 @@ if [[ -f "${MAINTENANCE_FILE}" ]]; then
     log "Scheduled maintenance is active; skipping recovery"
     exit 0
   fi
+fi
+
+# Refuse an absent/offline disk or configuration reset before any Docker I/O.
+if ! /Users/zack/.homebrew/bin/python3 /Users/zack/plex-docker/scripts/docker_storage_location.py --check-startup >/dev/null 2>&1; then
+  log "Approved external Docker disk is not ready; deferring recovery"
+  exit 1
 fi
 
 if [[ ! -x "${DOCKER}" ]] || ! "${DOCKER}" info >/dev/null 2>&1; then
@@ -144,7 +171,9 @@ recover_stack() {
       --file "${compose_file}" \
       "${env_args[@]}" \
       up --detach --no-deps --force-recreate "${recovery_services[@]}"
-  ) >>"${LOG_FILE}" 2>&1; then
+  ) 2>&1 | while IFS= read -r recovery_output || [[ -n "${recovery_output}" ]]; do
+    log "${recovery_output}"
+  done; then
     log "${stack_name} recovery command completed"
     return 0
   fi
